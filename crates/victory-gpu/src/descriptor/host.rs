@@ -1671,6 +1671,8 @@ impl HostHeap {
     /// [`HostHeap::release`]: the first's index.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
         if self.sampler || n == 0 || n > self.dynamic {
+            #[cfg(feature = "diagnostics")]
+            crate::draw::refused_slots(" (more slots than the dynamic region holds)");
             return None;
         }
         #[cfg(feature = "diagnostics")]
@@ -1712,6 +1714,14 @@ impl HostHeap {
             #[cfg(feature = "diagnostics")]
             {
                 use crate::copystat::{C, add};
+                let free = self.free.load(std::sync::atomic::Ordering::Relaxed);
+                crate::draw::refused_slots(if free < n as u32 {
+                    " (fewer free dynamic slots than asked)"
+                } else if !enough {
+                    " (a run as long failed since slots were last freed)"
+                } else {
+                    " (free dynamic slots, but no run that long)"
+                });
                 add(C::DynamicRefused, 1);
                 add(C::DynamicNs, started.elapsed().as_nanos() as u64);
             }
