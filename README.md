@@ -97,9 +97,15 @@ You need Windows 10 or 11, a Direct3D 12 card, and Rust (the version is pinned i
 copy victory.example.toml victory.toml      # then point game_dir at your own copy
 cargo build --locked --profile diag -p victory --features diagnostics
 target\diag\victory.exe shaders <your copy's shader files>
-target\diag\victory.exe warm --used                                  # after every build
+target\diag\victory.exe run <your copy's executable> --console series-s --execute   # with VICTORY_PIPELINE_BOOK=1
+target\diag\victory.exe warm --used
 target\diag\victory.exe run <your copy's executable> --console series-s --execute
 ```
+
+On a clean setup `warm --used` knows no pipelines yet ("0 pipelines known"): the list is written
+by a run with `VICTORY_PIPELINE_BOOK=1`. So the first run is cold (dropped draws, a mostly black
+picture), then warm, then run again. After switching to another card, use `warm --used --again`:
+the warm-up's bookkeeping is not keyed by the adapter yet.
 
 The settings the numbers above were measured with:
 
@@ -111,8 +117,9 @@ $env:VICTORY_MEMORY_MAP = '0'
 ```
 
 > [!TIP]
-> Warm the pipeline cache after every build (`warm --used`, same settings as the run). A new
-> build loses the warm-up, and a cold cache costs frames while the driver makes pipelines.
+> Warm with the same settings as the run. A rebuild that does not change the shader translator
+> keeps the warm-up (pipelines load from the layer's pipeline library); one that does needs
+> `warm --used` again, or the driver makes pipelines while you play.
 
 Keep `VICTORY_CACHE_DIR` and `VICTORY_DATA_DIR` outside this source tree: the layer refuses to
 write anything derived from the title below it. Do not set `VICTORY_THIN=1` on NVIDIA cards
