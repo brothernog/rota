@@ -54,44 +54,21 @@ fn build() -> [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        let mut bytes = env!("VICTORY_TRANSLATOR").as_bytes().to_vec();
-        bytes.extend_from_slice(&limit.to_le_bytes());
-        // Which group barriers wait is part of the translation too.
-        bytes.push(victory_shader::emit::group_sync());
-        // So are the switches that pick the form of a wave64 program:
-        // without them here a run with `VICTORY_WAVE_WIDE=0` was
-        // served the translations an earlier run of the same
-        // executable had cached with the switch unset.
-        for name in [
-            "VICTORY_WAVE_WIDE",
-            "VICTORY_WAVE_DEEP_SKIPS",
-            "VICTORY_WAVE_OWN_BITS",
-            "VICTORY_WAVE_LOCAL",
-            "VICTORY_F16_NEAREST",
-            "VICTORY_HELPER_OWN",
-            "VICTORY_FIRSTLANE_OWN",
-            "VICTORY_FIRST_HALF",
-            "VICTORY_STRICT_JOINS",
-            "VICTORY_MESH_OUTPUT_STRICT",
-            "VICTORY_BVH_FENCES",
-            "VICTORY_BVH_BOUNDS",
-            // Whether the ray-tracing node test always misses.
-            "VICTORY_RT_MISS",
-        ] {
-            bytes.extend_from_slice(name.as_bytes());
-            bytes.push(b'=');
-            if let Some(value) = std::env::var_os(name) {
-                bytes.extend_from_slice(value.as_encoded_bytes());
-            }
-            bytes.push(0);
-        }
-        // And which clean-up passes ran over the translated code.
-        bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
-        bytes
+        // Every switch the translator reads, found in its source at build
+        // time (a hand-kept list here missed `VICTORY_RDNA_FLOAT`), and the
+        // settings: a run with `VICTORY_WAVE_WIDE=0` was once served the
+        // translations of a run with it unset.
+        [env!("VICTORY_TRANSLATOR").as_bytes(), &victory_shader::emit::translation_fingerprint()].concat()
     });
+    key(fixed, victory_shader::emit::host_settings())
+}
+
+/// The cache key of the build's fixed part and the host facts. Pure, for
+/// testing.
+fn key(fixed: &[u8], host: [u32; 4]) -> [u8; 32] {
     let mut hash = blake3::Hasher::new();
     hash.update(fixed);
-    for value in victory_shader::emit::host_settings() {
+    for value in host {
         hash.update(&value.to_le_bytes());
     }
     *hash.finalize().as_bytes()
@@ -439,6 +416,15 @@ mod tests {
             }
         }
         files
+    }
+
+    #[test]
+    fn the_key_changes_with_the_translator_and_the_host() {
+        let base = key(b"translator a", [32, 1, 0, 0]);
+        assert_eq!(base, key(b"translator a", [32, 1, 0, 0]));
+        assert_ne!(base, key(b"translator b", [32, 1, 0, 0]));
+        assert_ne!(base, key(b"translator a", [64, 1, 0, 0]));
+        assert_ne!(base, key(b"translator a", [32, 1, 0, 1]));
     }
 
     #[test]

@@ -293,32 +293,54 @@ fn parse_set(value: Option<&str>, unset: u32, all: u32) -> u32 {
     parsed.map_or(unset, |n| n & all)
 }
 
-/// Everything a translation depends on besides the container: the
-/// translator's own source (hashed at build time), the value of every
-/// `VICTORY_*` switch it reads, the host facts the device hands it (widest
-/// wave, view heap limit) and the settings above. The shader cache keys on
-/// this instead of on the whole executable, so a rebuild that leaves the
-/// translator alone keeps its translations. Call it after the device is made.
+/// Everything a translation depends on besides the container and the host
+/// facts the device hands it ([`host_settings`]): the translator's own source
+/// (hashed at build time), the value of every `VICTORY_*` switch it reads
+/// (listed at build time, so a new switch joins the key by itself) and the
+/// settings above. The shader cache keys on this instead of on the whole
+/// executable, so a rebuild that leaves the translator alone keeps its
+/// translations.
 pub fn translation_fingerprint() -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(env!("VICTORY_SHADER_SOURCE_HASH").as_bytes());
-    out.push(u8::from(cfg!(feature = "diagnostics")));
-    out.push(u8::from(cfg!(debug_assertions)));
-    for name in env!("VICTORY_SHADER_SWITCHES").split(',').filter(|n| !n.is_empty()) {
+    fingerprint_of(
+        env!("VICTORY_SHADER_SOURCE_HASH"),
+        env!("VICTORY_SHADER_SWITCHES"),
+        |name| std::env::var_os(name),
+        // Not the build profile: `diagnostics` only reaches the translation
+        // through `loop_limit`, so diag and release builds share entries.
+        &[
+            loop_limit(),
+            u32::from(group_sync()),
+            shader_opt(),
+            rdna_float(),
+        ],
+    )
+}
+
+/// [`translation_fingerprint`] of a source hash, a comma-separated switch
+/// list, how a switch's value is read, and the settings. Pure, for testing.
+fn fingerprint_of(
+    source: &str,
+    switches: &str,
+    value: impl Fn(&str) -> Option<std::ffi::OsString>,
+    settings: &[u32],
+) -> Vec<u8> {
+    let mut out = source.as_bytes().to_vec();
+    out.push(0);
+    for name in switches.split(',').filter(|n| !n.is_empty()) {
         out.extend_from_slice(name.as_bytes());
-        out.push(b'=');
-        if let Some(value) = std::env::var_os(name) {
-            out.extend_from_slice(value.as_encoded_bytes());
+        // Unset and set to "" differ.
+        match value(name) {
+            Some(v) => {
+                out.push(b'=');
+                out.extend_from_slice(v.as_encoded_bytes());
+            }
+            None => out.push(b'!'),
         }
         out.push(0);
     }
-    out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
-    out.extend_from_slice(&lower::host_rdna().to_le_bytes());
-    out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());
-    out.extend_from_slice(&shader::raw_views().to_le_bytes());
-    out.extend_from_slice(&loop_limit().to_le_bytes());
-    out.push(group_sync());
-    out.extend_from_slice(&shader_opt().to_le_bytes());
+    for s in settings {
+        out.extend_from_slice(&s.to_le_bytes());
+    }
     out
 }
 
@@ -1038,6 +1060,44 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+
+    /// A wrong cache hit serves a translation of another translator: every
+    /// input of the key must change it, and nothing else may.
+    #[test]
+    fn the_cache_key_changes_with_every_input_of_a_translation() {
+        use std::ffi::OsString;
+        let unset = |_: &str| None;
+        let wide_off = |n: &str| (n == "VICTORY_WAVE_WIDE").then(|| OsString::from("0"));
+        let wide_on = |n: &str| (n == "VICTORY_WAVE_WIDE").then(|| OsString::from("1"));
+        let wide_empty = |n: &str| (n == "VICTORY_WAVE_WIDE").then(OsString::new);
+        let other = |n: &str| (n == "VICTORY_NOT_READ").then(|| OsString::from("1"));
+        let switches = "VICTORY_RT_MISS,VICTORY_WAVE_WIDE";
+        let key = |source, value: &dyn Fn(&str) -> Option<OsString>, settings: &[u32]| {
+            super::fingerprint_of(source, switches, value, settings)
+        };
+        let base = key("aa", &unset, &[1, 2]);
+        assert_eq!(base, key("aa", &unset, &[1, 2]), "same inputs, same key");
+        assert_eq!(base, key("aa", &other, &[1, 2]), "a switch the translator does not read");
+        let changed = [
+            key("ab", &unset, &[1, 2]),
+            key("aa", &wide_off, &[1, 2]),
+            key("aa", &wide_on, &[1, 2]),
+            key("aa", &wide_empty, &[1, 2]),
+            key("aa", &unset, &[1, 3]),
+            key("aa", &unset, &[1, 2, 0]),
+        ];
+        for (i, k) in changed.iter().enumerate() {
+            assert_ne!(&base, k, "input {i} did not change the key");
+            for (j, l) in changed.iter().enumerate().skip(i + 1) {
+                assert_ne!(k, l, "inputs {i} and {j} gave one key");
+            }
+        }
+        // The build-time list holds the switches that shape a translation.
+        let listed: Vec<&str> = env!("VICTORY_SHADER_SWITCHES").split(',').collect();
+        for name in ["VICTORY_WAVE_WIDE", "VICTORY_RT_MISS", "VICTORY_RDNA_FLOAT", "VICTORY_GROUP_SYNC"] {
+            assert!(listed.contains(&name), "{name} is not in the key");
+        }
+    }
 
     /// The LLVM text `dxc -dumpbin` prints for a DXIL container, when dxc
     /// is installed.
