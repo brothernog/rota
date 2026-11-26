@@ -9642,16 +9642,28 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
         .fold(state, |s, &(_, _, bits)| s & !bits)
 }
 
+/// The vendor id of Microsoft's adapters: WARP and the basic render driver.
+#[cfg(test)]
+const MICROSOFT_VENDOR: u32 = 0x1414;
+
 impl Host {
-    /// Whether the device is on a software adapter (WARP, as on CI machines),
-    /// or on one this cannot tell (no adapter, or one of Microsoft's).
+    /// Whether the device may be on a software adapter (WARP, or the basic
+    /// render driver CI machines without a card get by default). Microsoft's
+    /// vendor id counts as software whatever the flags say, and an adapter
+    /// that cannot be described counts too: a test that needs a card skips.
     #[cfg(test)]
     pub(crate) fn software(&self) -> bool {
         // SAFETY: a plain query.
-        // Microsoft's adapters (basic render, virtual machine video) are not always flagged software,
-        // and the CI machines' adapter let through a draw that depth bounds should have rejected.
-        self.adapter.as_ref().and_then(|a| unsafe { a.cast::<IDXGIAdapter1>().ok()?.GetDesc1().ok() })
-            .is_none_or(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 || d.VendorId == 0x1414)
+        let desc = self.adapter.as_ref().and_then(|a| unsafe { a.cast::<IDXGIAdapter1>().ok()?.GetDesc1().ok() });
+        let Some(d) = desc else {
+            eprintln!("host adapter not known");
+            return true;
+        };
+        eprintln!(
+            "host adapter: vendor={:#x} device={:#x} flags={:#x}",
+            d.VendorId, d.DeviceId, d.Flags
+        );
+        d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 || d.VendorId == MICROSOFT_VENDOR
     }
 
     /// The card's memory as the system accounts it to this process, in

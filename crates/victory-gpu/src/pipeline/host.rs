@@ -1222,7 +1222,8 @@ mod tests {
             eprintln!("no host depth bounds support; skipped");
             return;
         }
-        // WARP reports depth bounds but lets the draw through (the CI machines have no card).
+        // WARP and the basic render driver report depth bounds but let the
+        // draw through (the CI machines have no card).
         if host.software() {
             eprintln!("software adapter; skipped");
             return;
