@@ -6,8 +6,8 @@
 //!
 //! When the PC's free memory or commit runs low this limits what a texture pass prefetches,
 //! gives back idle staging blocks, holds off for 500 ms after an `E_OUTOFMEMORY`, and pauses
-//! the pass. `VICTORY_RESIDENCY`: unset, on with 32 GiB of RAM or less; `0`, off (every
-//! function here then says "no pressure" and nothing changes); `1`, on.
+//! the pass. `VICTORY_RESIDENCY=1` turns it on; unset or anything else, off (every
+//! function here then says "no pressure" and nothing changes).
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
@@ -24,12 +24,11 @@ fn memory_status() -> Option<MEMORYSTATUSEX> {
     (unsafe { GlobalMemoryStatusEx(&mut status) } != 0).then_some(status)
 }
 
-fn switch(var: Option<&std::ffi::OsStr>, total_physical: Option<u64>) -> bool {
-    match var.and_then(|v| v.to_str()) {
-        Some("0") => false,
-        Some("1") => true,
-        _ => total_physical.is_some_and(|total| total <= 32 * GIB),
-    }
+// Off by default: on an RTX 3050 / 32 GB PC two run pairs were smoother and
+// faster without it (5.4 vs 4.8 and 5.7 vs ~5.0 fps median), and the system
+// memory peak stayed at ~31.5 GB either way.
+fn switch(var: Option<&std::ffi::OsStr>) -> bool {
+    var.is_some_and(|v| v == "1")
 }
 
 /// Whether the module acts at all (`VICTORY_RESIDENCY`, see the top).
@@ -37,7 +36,7 @@ pub(crate) fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     cfg!(test)
         || *ON.get_or_init(|| {
-            switch(std::env::var_os("VICTORY_RESIDENCY").as_deref(), memory_status().map(|s| s.ullTotalPhys))
+            switch(std::env::var_os("VICTORY_RESIDENCY").as_deref())
         })
 }
 
@@ -264,14 +263,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn switch_follows_the_variable_then_the_ram() {
+    fn switch_is_on_only_when_asked() {
         use std::ffi::OsStr;
-        assert!(switch(None, Some(32 * GIB)));
-        assert!(!switch(None, Some(32 * GIB + 1)));
-        assert!(!switch(None, None));
-        assert!(!switch(Some(OsStr::new("0")), Some(8 * GIB)));
-        assert!(switch(Some(OsStr::new("1")), Some(64 * GIB)));
-        assert!(switch(Some(OsStr::new("")), Some(16 * GIB)));
+        assert!(!switch(None));
+        assert!(!switch(Some(OsStr::new("0"))));
+        assert!(!switch(Some(OsStr::new(""))));
+        assert!(switch(Some(OsStr::new("1"))));
     }
 
     #[test]
