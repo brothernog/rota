@@ -1198,6 +1198,9 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// With `VICTORY_GPU_RANK`: the runs of commands timed by pipeline.
+    #[cfg(feature = "diagnostics")]
+    rank: Mutex<rank::ListRank>,
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -3652,6 +3655,7 @@ pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
 mod panel;
 mod place;
+pub(crate) mod rank;
 mod send;
 pub(crate) use send::{goes_as_words, words_under};
 #[cfg(feature = "diagnostics")]
@@ -4079,6 +4083,8 @@ impl Host {
                 notes,
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                #[cfg(feature = "diagnostics")]
+                rank: Mutex::default(),
             })
         }
     }
@@ -5575,6 +5581,8 @@ impl Host {
         }
         stage.next("submit: the lists' steps");
         for list in runs {
+            #[cfg(feature = "diagnostics")]
+            list.rank_sent();
             list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
@@ -6071,7 +6079,7 @@ impl HostList {
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
     fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
-        if !timing() {
+        if !timing() && !rank::on() {
             return None;
         }
         self.stamps
@@ -6146,6 +6154,12 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         let _closing = crate::timeline::span("closing a host list");
+        // The last run of draws ends before the closing work.
+        #[cfg(feature = "diagnostics")]
+        if rank::on() {
+            let slot = self.rank.lock().unwrap_or_else(|e| e.into_inner()).close_runs();
+            self.rank_stamp(slot);
+        }
         self.twins_to_depth();
         self.textures_back();
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -6157,11 +6171,18 @@ impl HostList {
         self.take_coming();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
-            let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
-            // SAFETY: an open list, our heap and read-back buffer.
-            unsafe {
-                self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, count);
-                self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
+            let last = if timing() {
+                let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
+                Some((count, count + 1))
+            } else {
+                self.rank.lock().unwrap_or_else(|e| e.into_inner()).close_list()
+            };
+            if let Some((slot, count)) = last {
+                // SAFETY: an open list, our heap and read-back buffer.
+                unsafe {
+                    self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, slot);
+                    self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count, back, 0);
+                }
             }
         }
         // SAFETY: our list.
@@ -6201,6 +6222,8 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         let _resetting = crate::timeline::span("resetting a host list");
+        #[cfg(feature = "diagnostics")]
+        self.rank_harvest();
         self._alive.used();
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.deferred() = Deferred::default();
@@ -6228,6 +6251,11 @@ impl HostList {
         };
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
+        }
+        #[cfg(feature = "diagnostics")]
+        if rank::on() {
+            let slot = self.rank.lock().unwrap_or_else(|e| e.into_inner()).begin();
+            self.rank_stamp(Some(slot));
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
@@ -6645,6 +6673,70 @@ impl HostList {
                 .push((what, range));
             crate::copystat::add(crate::copystat::C::NoteNs, started.elapsed().as_nanos() as u64);
         }
+    }
+
+    /// A draw or dispatch of `kind` with the pipeline `p` gives is about to
+    /// be recorded: a timestamp if it starts a run (`VICTORY_GPU_RANK`).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn rank<'a>(&self, p: impl FnOnce() -> Option<&'a crate::pipeline::host::HostPipeline>, kind: rank::Kind) {
+        if !rank::on() {
+            return;
+        }
+        let Some(p) = p() else {
+            return;
+        };
+        let pipeline = p.pso.as_raw() as usize;
+        let slot = self.rank.lock().unwrap_or_else(|e| e.into_inner()).command(
+            pipeline,
+            kind,
+            || rank::name(pipeline, &p.name),
+            STAMPS,
+        );
+        self.rank_stamp(slot);
+    }
+
+    /// Writes a timestamp in `slot` (ranking).
+    #[cfg(feature = "diagnostics")]
+    fn rank_stamp(&self, slot: Option<u32>) {
+        if let (Some(slot), Some((heap, _))) = (slot, self.stamps()) {
+            // SAFETY: an open list and our query heap; the slot is below
+            // `STAMPS` (`rank::ListRank::command`).
+            unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, slot) };
+        }
+    }
+
+    /// The list was submitted (ranking).
+    #[cfg(feature = "diagnostics")]
+    fn rank_sent(&self) {
+        if rank::on() {
+            self.rank.lock().unwrap_or_else(|e| e.into_inner()).sent();
+        }
+    }
+
+    /// Adds what the list's last run timed to the ranking: only after its
+    /// last submission finished (from `reset`).
+    #[cfg(feature = "diagnostics")]
+    fn rank_harvest(&self) {
+        if !rank::on() {
+            return;
+        }
+        let list = std::mem::take(&mut *self.rank.lock().unwrap_or_else(|e| e.into_inner()));
+        let (Some(count), Some((_, back))) = (list.written(), self.stamps()) else {
+            return;
+        };
+        let count = (count as usize).min(STAMPS as usize);
+        let mut data = std::ptr::null_mut();
+        let range = D3D12_RANGE { Begin: 0, End: count * 8 };
+        // SAFETY: a read-back buffer the finished list resolved into.
+        let stamps: Vec<u64> = unsafe {
+            if back.Map(0, Some(&range), Some(&mut data)).is_err() {
+                return;
+            }
+            let s = std::slice::from_raw_parts(data.cast::<u64>(), count).to_vec();
+            back.Unmap(0, Some(&D3D12_RANGE::default()));
+            s
+        };
+        rank::harvest(&list, &stamps);
     }
 
     /// Whether nothing recorded since the list was opened does any work:
@@ -8877,6 +8969,8 @@ impl Meter {
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
+        #[cfg(feature = "diagnostics")]
+        rank::presented();
         self.frames += 1;
         #[cfg(feature = "diagnostics")]
         {

@@ -2712,6 +2712,8 @@ impl State {
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         #[cfg(feature = "diagnostics")]
+        list.rank(|| Some(p), crate::host::rank::Kind::Dispatch);
+        #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_builder(self.pipeline as This) {
             crate::capture::op(list as *const _ as usize, || format!("builder {}", p.name));
             self.list_dropped_roots([x, y, z]);
@@ -3070,6 +3072,8 @@ impl State {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
+                    #[cfg(feature = "diagnostics")]
+                    list.rank(|| crate::pipeline::host_pipeline(self.pipeline as This), crate::host::rank::Kind::Mesh);
                     self.mesh_scissor(list, true);
                     #[cfg(feature = "diagnostics")]
                     if let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) {
@@ -3620,6 +3624,8 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            #[cfg(feature = "diagnostics")]
+            list.rank(|| crate::pipeline::host_pipeline(self.pipeline as This), crate::host::rank::Kind::Draw);
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -3725,6 +3731,8 @@ impl State {
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            #[cfg(feature = "diagnostics")]
+            list.rank(|| crate::pipeline::host_pipeline(self.pipeline as This), crate::host::rank::Kind::Draw);
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -4014,6 +4022,8 @@ impl State {
         });
         #[cfg(feature = "diagnostics")]
         list.ran_indirect(p.pso.as_raw() as usize, &p.name, kind, max, &self.user);
+        #[cfg(feature = "diagnostics")]
+        list.rank(|| Some(p), crate::host::rank::indirect(kind));
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
