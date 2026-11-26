@@ -70,6 +70,30 @@ thread_local! {
     /// milliseconds and the bytes that run may take, in place of the
     /// pass's own per frame.
     static PASS_BUDGET: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+    /// Why the draw being prepared was refused (the first reason noted),
+    /// and why dynamic slots were refused, if they were (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    static REFUSED: std::cell::Cell<(&'static str, &'static str)> = const { std::cell::Cell::new(("", "")) };
+}
+
+/// Notes why the draw being prepared cannot run (diagnostics; the first
+/// reason wins, so an inner one is kept) and returns false.
+pub(crate) fn refuse(_why: &'static str) -> bool {
+    #[cfg(feature = "diagnostics")]
+    REFUSED.with(|r| {
+        let (why, slots) = r.get();
+        if why.is_empty() {
+            r.set((_why, slots));
+        }
+    });
+    false
+}
+
+/// Notes why [`crate::descriptor::host::HostHeap::dynamic`] refused slots
+/// (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn refused_slots(why: &'static str) {
+    REFUSED.with(|r| r.set((r.get().0, why)));
 }
 
 /// The milliseconds of every frame the pass that uploads textures picked
@@ -1285,7 +1309,15 @@ impl State {
         let heap = match self.heaps[0] {
             0 => None,
             h => crate::descriptor::heap(h as This).host(),
-        }?;
+        };
+        let Some(heap) = heap else {
+            refuse(if self.heaps[0] == 0 {
+                "title memory by address without a view heap"
+            } else {
+                "title memory by address: view heap without a host copy"
+            });
+            return None;
+        };
         let (mut addresses, mut constants) = (Vec::new(), Vec::new());
         // (What it may write: its root views of unordered access.)
         let written: Vec<u64> = t
@@ -1333,14 +1365,14 @@ impl State {
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
-            return false;
+            return refuse("skipped shader");
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
-            return false;
+            return refuse("no host pipeline");
         };
         if p.compute || p.mesh != mesh {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
-            return false;
+            return refuse("a pipeline of another kind");
         }
         if p.rects && self.topology != RECTANGLES {
             // Its geometry stage would turn each triangle into a rectangle.
@@ -1380,7 +1412,7 @@ impl State {
         if indexed {
             let v = self.index;
             let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
-                return false;
+                return refuse("index buffer outside title buffers");
             };
             shadow.refresh(list, v.address, u64::from(v.size));
             let view = D3D12_INDEX_BUFFER_VIEW {
@@ -1496,7 +1528,7 @@ impl State {
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
-                return false;
+                return refuse("descriptor table without dynamic slots");
             }
             if stage.shader.ambient.is_some() {
                 self.ambient_tables.clear();
@@ -1517,7 +1549,7 @@ impl State {
                 };
                 let Some(ready) = self.memory_ready(list, &t, compute, use_) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
-                    return false;
+                    return refuse("title memory by address not ready");
                 };
                 Some(ready)
             } else {
@@ -1724,7 +1756,11 @@ impl State {
         if !crate::pipeline::host::bounded_root_srvs() {
             let Some((a, s)) = address.and_then(|a| Some((a, find(a)?))) else {
                 once!("a root UAV with nothing to bind: the draw is dropped");
-                return false;
+                return refuse(if address.is_none() {
+                    "root UAV not set (VICTORY_ROOT_SRV_DIRECT)"
+                } else {
+                    "root UAV without a writable host copy (VICTORY_ROOT_SRV_DIRECT)"
+                });
             };
             ready(a, &s);
             // From the 16 bytes below: the shader adds the rest.
@@ -1747,7 +1783,7 @@ impl State {
         };
         let Some((heap, host)) = heap.and_then(|h| Some((h, h.host()?))) else {
             once!("a root UAV without a bound view heap: the draw is dropped");
-            return false;
+            return refuse("root UAV without a bound view heap");
         };
         let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0));
         let (index, shadow) = match self.root_uav_slots.get(&key) {
@@ -1755,7 +1791,7 @@ impl State {
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
                 let Some(index) = host.dynamic(1) else {
-                    return false;
+                    return refuse("root UAV without a dynamic slot");
                 };
                 self.dynamic.push((key.0, index, 1));
                 if let Some((a, s)) = &shadow {
@@ -1813,7 +1849,7 @@ impl State {
         };
         let Some((heap, host)) = heap.and_then(|h| Some((h, h.host()?))) else {
             once!("a root SRV without a bound view heap: the draw is dropped");
-            return false;
+            return refuse("root SRV without a bound view heap");
         };
         // A view that begins early is another view than one that does not
         // (title addresses stay below bit 63).
@@ -1826,7 +1862,7 @@ impl State {
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
                 let Some(index) = host.dynamic(1) else {
-                    return false;
+                    return refuse("root SRV without a dynamic slot");
                 };
                 self.dynamic.push((key.0, index, 1));
                 self.root_srv_slots
@@ -3881,6 +3917,8 @@ impl State {
                 (bounded, 0)
             }
         };
+        #[cfg(feature = "diagnostics")]
+        REFUSED.set(("", ""));
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
@@ -3888,7 +3926,12 @@ impl State {
             _ => false,
         };
         if !ran {
-            why("prepare failed");
+            #[cfg(feature = "diagnostics")]
+            {
+                let (refused, slots) = REFUSED.replace(("", ""));
+                let refused = if refused.is_empty() { "unknown" } else { refused };
+                why(&format!("prepare failed: {refused}{slots}"));
+            }
             return false;
         }
         #[cfg(feature = "diagnostics")]

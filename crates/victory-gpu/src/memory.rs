@@ -907,7 +907,10 @@ pub(crate) fn ready(
     if guard.is_none() {
         *guard = Memory::new();
     }
-    let m = guard.as_mut()?;
+    let Some(m) = guard.as_mut() else {
+        crate::draw::refuse("title memory by address: directory not made");
+        return None;
+    };
     let frame = crate::frame::current();
     if m.frame != frame {
         m.frame = frame;
@@ -1030,7 +1033,10 @@ pub(crate) fn ready(
         Some(&run) => run,
         None => {
             // Held for the heap's life: not given back with a list's slots.
-            let base = heap.dynamic(COPIES + 1)?;
+            let Some(base) = heap.dynamic(COPIES + 1) else {
+                crate::draw::refuse("title memory by address without dynamic slots");
+                return None;
+            };
             // Every slot of the run: a number shows no view of another kind.
             for n in 0..=COPIES {
                 heap.null_raw_uav_at(base + n);
