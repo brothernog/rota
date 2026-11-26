@@ -1296,6 +1296,41 @@ fn base_level(desc: &ResourceDesc, first: u32) -> u32 {
     base
 }
 
+/// How many of the largest levels the host copy of a placed texture
+/// described by `desc` leaves out for good (`VICTORY_TEXTURE_DROP_MIPS=N`,
+/// 1 to 4; off by default). A floor under [`HostTexture::base`], decided by
+/// the description alone: a copy never grows those levels back
+/// ([`want_level`]), and views of them show its level 0 (`from_base`).
+/// Adapted from soldsawn/victory-nvidia-8gb at 637a03fa (GPL-3.0), which
+/// drops them from every texture the title fills and shifts views and
+/// copies; here only placed textures, which no copy names.
+#[cfg(windows)]
+fn drop_levels(desc: &ResourceDesc) -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let n = *N.get_or_init(|| {
+        let n = std::env::var("VICTORY_TEXTURE_DROP_MIPS").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0).min(4);
+        if n > 0 {
+            tracing::info!(levels = n, "VICTORY_TEXTURE_DROP_MIPS: placed textures leave out their largest levels");
+        }
+        n
+    });
+    if n == 0 || !held_only() {
+        return 0;
+    }
+    drop_for(n, desc.width, u64::from(desc.height), u32::from(desc.mip_levels))
+}
+
+/// [`drop_levels`] of `n` for a texture of that size and levels: only of
+/// one 512 texels or more on its shorter side with five levels or more,
+/// and at least one level kept (as the fork).
+#[cfg(any(windows, test))]
+fn drop_for(n: u32, width: u64, height: u64, mips: u32) -> u32 {
+    if n == 0 || mips < 5 || width.min(height) < 512 {
+        return 0;
+    }
+    n.min(mips - 1)
+}
+
 /// The bytes of title memory a placed texture with the resource description
 /// `desc` is read from for a view that starts at level `first`; `None` as
 /// [`placed_bytes`]. Remembered: asked for every slot that is looked at.
@@ -1354,6 +1389,13 @@ pub(crate) fn want_level(this: This, first: u32) {
         return;
     };
     if host.base == 0 || host.base <= base_level(&r.desc, first) {
+        return;
+    }
+    // The same floor as `hosted`: levels dropped for good are not wanted,
+    // except by the copy of a texture found to alias another later
+    // (`crate::texture::alias`), which needs them all.
+    let drop = drop_levels(&r.desc);
+    if drop > 0 && host.base <= base_level(&r.desc, first.max(drop)) && alias_of(this).is_none() {
         return;
     }
     r.host.wanted.store(first, Relaxed);
@@ -1581,9 +1623,10 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             let wanted = r.host.wanted.load(Relaxed);
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
             let first = wanted.min(viewed);
-            if first != u32::MAX {
-                base = base_level(&r.desc, first);
-            }
+            // `VICTORY_TEXTURE_DROP_MIPS`: a floor, also before any view.
+            let drop = drop_levels(&r.desc);
+            let first = if first == u32::MAX { drop } else { first.max(drop) };
+            base = base_level(&r.desc, first);
         }
         let texture = match texture {
             Some(texture) => Some(texture),
@@ -4659,5 +4702,45 @@ float4 lit() : SV_Target { return 1.0; }
         let d = unsafe { more.texture.GetDesc() };
         assert_eq!((more.base, d.Width, d.MipLevels), (0, 256, 9));
         assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// `VICTORY_TEXTURE_DROP_MIPS`: textures of 512 texels or more on the
+    /// shorter side and five levels or more, at least one level kept.
+    #[test]
+    fn levels_dropped_by_size() {
+        assert_eq!(drop_for(0, 4096, 4096, 13), 0);
+        assert_eq!(drop_for(2, 4096, 2048, 13), 2);
+        assert_eq!(drop_for(4, 512, 512, 10), 4);
+        // fewer levels than the drop: at least one kept
+        assert_eq!(drop_for(4, 1024, 1024, 5), 4);
+        assert_eq!(drop_for(4, 4096, 4096, 3), 0);
+        assert_eq!(drop_for(1, 4096, 4096, 4), 0);
+        // small or thin
+        assert_eq!(drop_for(2, 256, 256, 9), 0);
+        assert_eq!(drop_for(2, 4096, 256, 13), 0);
+    }
+
+    /// The floor of `VICTORY_TEXTURE_DROP_MIPS` under the host copy's first
+    /// level: a copy made with no view yet starts at the floor, and no view
+    /// makes `want_level` grow it below that (`hosted` and `want_level` both
+    /// take `base_level` of the view's first level raised to the floor).
+    #[cfg(windows)]
+    #[test]
+    fn dropped_levels_are_never_wanted_back() {
+        // 1024x1024 BC7, eleven levels.
+        let words = [3u32, 0, 0, 0, 1024, 0, 1024, 0xb_0001, 98, 1, 0, 0x105, 0, 0];
+        // SAFETY: 56 bytes in the description's layout.
+        let desc = unsafe { words.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+        for n in 1..=4 {
+            let drop = drop_for(n, desc.width, u64::from(desc.height), u32::from(desc.mip_levels));
+            assert_eq!(drop, n);
+            let made = base_level(&desc, drop);
+            assert!(made > 0 && made <= drop, "{n}: {made}");
+            for first in 0..u32::from(desc.mip_levels) {
+                let base = base_level(&desc, first.max(drop));
+                assert!(base >= made, "{n} {first}: {base} < {made}");
+                assert!(base < u32::from(desc.mip_levels));
+            }
+        }
     }
 }
