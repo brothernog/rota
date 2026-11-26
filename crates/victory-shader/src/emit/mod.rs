@@ -1094,9 +1094,22 @@ mod tests {
         }
         // The build-time list holds the switches that shape a translation.
         let listed: Vec<&str> = env!("VICTORY_SHADER_SWITCHES").split(',').collect();
-        for name in ["VICTORY_WAVE_WIDE", "VICTORY_RT_MISS", "VICTORY_RDNA_FLOAT", "VICTORY_GROUP_SYNC"] {
+        for name in ["VICTORY_WAVE_WIDE", "VICTORY_RT_MISS", "VICTORY_RDNA_FLOAT", "VICTORY_GROUP_SYNC", "VICTORY_LEAN_MATH"] {
             assert!(listed.contains(&name), "{name} is not in the key");
         }
+    }
+
+    /// `VICTORY_LEAN_MATH` reads a number of up to eight bits; anything
+    /// else is every form exact.
+    #[test]
+    fn lean_math_reads_its_bits() {
+        use super::lower::lean_bits;
+        assert_eq!(lean_bits(None), 0);
+        assert_eq!(lean_bits(Some("247")), 247);
+        assert_eq!(lean_bits(Some(" 7 ")), 7);
+        assert_eq!(lean_bits(Some("511")), 255);
+        assert_eq!(lean_bits(Some("fast")), 0);
+        assert_eq!(lean_bits(Some("-1")), 0);
     }
 
     /// The LLVM text `dxc -dumpbin` prints for a DXIL container, when dxc
