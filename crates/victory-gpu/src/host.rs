@@ -9643,12 +9643,15 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
 }
 
 impl Host {
-    /// Whether the device is on a software adapter (WARP, as on CI machines).
+    /// Whether the device is on a software adapter (WARP, as on CI machines),
+    /// or on one this cannot tell (no adapter, or one of Microsoft's).
     #[cfg(test)]
     pub(crate) fn software(&self) -> bool {
         // SAFETY: a plain query.
+        // Microsoft's adapters (basic render, virtual machine video) are not always flagged software,
+        // and the CI machines' adapter let through a draw that depth bounds should have rejected.
         self.adapter.as_ref().and_then(|a| unsafe { a.cast::<IDXGIAdapter1>().ok()?.GetDesc1().ok() })
-            .is_some_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0)
+            .is_none_or(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 || d.VendorId == 0x1414)
     }
 
     /// The card's memory as the system accounts it to this process, in

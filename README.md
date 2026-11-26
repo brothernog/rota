@@ -104,8 +104,8 @@ target\diag\victory.exe run <your copy's executable> --console series-s --execut
 
 On a clean setup `warm --used` knows no pipelines yet ("0 pipelines known"): the list is written
 by a run with `VICTORY_PIPELINE_BOOK=1`. So the first run is cold (dropped draws, a mostly black
-picture), then warm, then run again. After switching to another card, use `warm --used --again`:
-the warm-up's bookkeeping is not keyed by the adapter yet.
+picture), then warm, then run again. The warm-up's bookkeeping is kept per card, so after
+switching cards `warm --used` makes that card's pipelines on its own.
 
 The settings the numbers above were measured with:
 
