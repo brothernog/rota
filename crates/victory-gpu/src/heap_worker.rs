@@ -86,16 +86,19 @@ impl Table {
         match self.entries.get(&key).copied() {
             // Read in this frame or the last one, and after the upload (one
             // read in the upload's frame may be of the memory before it).
-            Some(Entry::Seen { print, read_at }) if read_at > uploaded && read_at + 1 >= frame => {
-                self.entries.remove(&key);
-                Look::Print(print)
-            }
+            // Kept for other slots of the same memory; old ones go above.
+            Some(Entry::Seen { print, read_at }) if read_at > uploaded && read_at + 1 >= frame => Look::Print(print),
             Some(Entry::Asked { since }) if frame >= since + WAIT_FRAMES => {
                 self.entries.remove(&key);
                 Look::Here
             }
             Some(Entry::Asked { .. }) => Look::Later,
-            Some(Entry::Seen { .. }) => self.ask(key, frame),
+            // Too old, or from before the upload: taken here. (Asked again,
+            // a slot the pass reaches every other frame never had an answer.)
+            Some(Entry::Seen { .. }) => {
+                self.entries.remove(&key);
+                Look::Here
+            }
             None if self.entries.len() >= CAP => Look::Here,
             None => self.ask(key, frame),
         }
@@ -212,8 +215,9 @@ mod tests {
         t.queue.clear();
         t.seen((0x1000, 64), 77, 10);
         assert_eq!(t.look(0x1000, 64, 5, 11, false), Look::Print(77));
-        // Taken: the next look asks anew.
-        assert_eq!(t.look(0x1000, 64, 5, 11, false), Look::Later);
+        // Another slot of the same memory has it too.
+        assert_eq!(t.look(0x1000, 64, 3, 11, false), Look::Print(77));
+        assert!(t.queue.is_empty());
     }
 
     #[test]
@@ -222,8 +226,8 @@ mod tests {
         t.look(0x2000, 64, 0, 10, false);
         t.seen((0x2000, 64), 1, 10);
         // Uploaded again at frame 10 (a bake): read in that frame, maybe before.
-        assert_eq!(t.look(0x2000, 64, 10, 10, false), Look::Later);
-        assert_eq!(t.queue.len(), 2);
+        assert_eq!(t.look(0x2000, 64, 10, 10, false), Look::Here);
+        assert!(!t.entries.contains_key(&(0x2000, 64)));
     }
 
     #[test]
@@ -231,6 +235,8 @@ mod tests {
         let mut t = Table::default();
         t.look(0x3000, 64, 0, 10, false);
         t.seen((0x3000, 64), 1, 10);
+        assert_eq!(t.look(0x3000, 64, 0, 12, false), Look::Here);
+        // And the next look asks anew.
         assert_eq!(t.look(0x3000, 64, 0, 12, false), Look::Later);
     }
 
