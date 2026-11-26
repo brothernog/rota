@@ -1205,6 +1205,13 @@ mod host {
                     }
                 }
             }
+            if slot == 0 {
+                for vk in from_file() {
+                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
+                        pad.buttons |= button;
+                    }
+                }
+            }
             Some(pad)
         }
 
@@ -1213,6 +1220,11 @@ mod host {
             let mut down = scripted();
             #[cfg(not(feature = "diagnostics"))]
             let mut down = Vec::new();
+            for vk in from_file() {
+                if !down.contains(&vk) {
+                    down.push(vk);
+                }
+            }
             if focused() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
@@ -1285,6 +1297,60 @@ mod host {
             .filter(|&&(from, to, _)| (from..to).contains(&now))
             .map(|&(_, _, vk)| vk)
             .collect()
+    }
+
+    /// A key named ([`key_code`]) in the file `VICTORY_KEYS_FILE` names is
+    /// held for 0.2 s, with or without focus, and the file is removed: a
+    /// tool that drives the title's menus (its terms, its account screen)
+    /// while another window has the focus writes it, instead of a key press
+    /// the title only sees in the foreground. Unset: nothing is read.
+    fn from_file() -> Vec<u8> {
+        static PATH: LazyLock<Option<std::path::PathBuf>> =
+            LazyLock::new(|| std::env::var_os("VICTORY_KEYS_FILE").map(Into::into));
+        /// The key held now and until when; when the file was last looked at.
+        static HELD: Mutex<(Option<(u8, Instant)>, Option<Instant>)> = Mutex::new((None, None));
+        let Some(path) = PATH.as_ref() else {
+            return Vec::new();
+        };
+        let mut held = HELD.lock().unwrap_or_else(PoisonError::into_inner);
+        let now = Instant::now();
+        if let Some((vk, until)) = held.0 {
+            if now < until {
+                return vec![vk];
+            }
+            held.0 = None;
+        }
+        // Looked at ten times a second at most: the title asks every frame.
+        if held.1.is_some_and(|last| now.duration_since(last) < Duration::from_millis(100)) {
+            return Vec::new();
+        }
+        held.1 = Some(now);
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return Vec::new();
+        };
+        let _ = std::fs::remove_file(path);
+        let Some(vk) = key_code(text.trim()) else {
+            return Vec::new();
+        };
+        held.0 = Some((vk, now + Duration::from_millis(200)));
+        vec![vk]
+    }
+
+    /// The virtual key of a key's name in [`from_file`]: a letter, a digit, or
+    /// `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`, `Left`, `Right`.
+    fn key_code(key: &str) -> Option<u8> {
+        Some(match key {
+            "Enter" => 0x0D,
+            "Esc" => 0x1B,
+            "Tab" => 0x09,
+            "Back" => 0x08,
+            "Up" => 0x26,
+            "Down" => 0x28,
+            "Left" => 0x25,
+            "Right" => 0x27,
+            k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => k.as_bytes()[0].to_ascii_uppercase(),
+            _ => return None,
+        })
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
