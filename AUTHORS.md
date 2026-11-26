@@ -1,0 +1,184 @@
+# Authors
+
+This project is a fork. Its code comes from these projects, all GPL-3.0-or-later:
+
+- VIctory, the compatibility layer it is built on, and its contributors.
+- fxceless/victory-fork, and edsuuu/VI-BR-PORT, the fork this one starts from
+  (imported at commit 3fd18be).
+
+The people below wrote the imported code, listed by the number of commits they
+authored in the imported history (`git shortlog -sn`; AI tools left out).
+Their copyright stays with them; see [LICENSE](LICENSE).
+
+- edsuuu
+- local
+- r4.
+- Marvis
+- SkippySteve
+- MamaLeVrai
+- Duff
+- fxceless
+- TG0000
+- Manuel Pérez
+- Maraco91
+- quaternion
+- review
+- marquezini
+- 给伊莉雅补魔
+- Yaekai
+- AnoHunted
+- Nikita Romanovich
+- Review
+- wrothgaril
+- FIocker
+- Vyacheslav Venglovsky
+- ifBars
+- tedin7
+- BastienRdz
+- Enzo Souza Duarte
+- Pedro Fortunato
+- antikohza
+- asc
+- bittertea0323
+- fuzeofficial
+- 9hvn9yt2vk-netizen
+- lordon1a
+- raffclar
+- Luiz Neves
+- Peter Bonanni
+- artor410
+- desp
+- Andrea
+- EatCodeSleep2
+- Henrique Bueno
+- LF2000 Builder
+- Noname0202
+- fever308
+- nathanbzrr
+- uiliannn
+- Andrea Casale
+- Dom
+- Leonardo Pinheiro
+- Ortomanic
+- Saitken91
+- Tex
+- alfycs
+- hophaver
+- jaschinski97-ops
+- mpDom
+- AlanQiang0418
+- Alexis
+- AugustoZFJ
+- Aws
+- BaggyALPHA
+- Bloxive
+- CesarLopesO
+- David Palacios
+- Diego
+- Exorion
+- GamingRipperDoc
+- Jeremy Goldberg
+- Kam471
+- KoLolX3
+- LUIS LARIOS
+- Louis Faust
+- Peppacodes
+- RedBeggins Dev
+- Swarm
+- TheHoracio
+- Travis Curtsinger
+- Vanthys
+- Vax
+- William "kaairim" Deivid
+- broccolize
+- lameloball2813-ui
+- meower
+- permadiego
+- pes7
+- pgm1207
+- ruvenesh
+- spacede
+- swarm
+- undeadhuman37
+- ALFREDOHDEZ
+- Abdellah K.
+- Advait Palve
+- AgneyaK
+- Blitz Studios
+- Calvix2k
+- Carlos Sant'Anna
+- Castyan
+- Dathinel
+- Devin
+- DocBlack89
+- DoubleD17
+- Eduardo Bertozzi
+- Faultz
+- FibbS6
+- Giuseppe Rainone
+- HailLucifer666
+- Halfect
+- Henrique Developer
+- Jithu Chilukuri
+- KainanP
+- KaiserBloo
+- Key
+- LAKSHYA-cmd-tech
+- LaunchDoesntCode
+- Loggerten
+- Looper_Salty
+- Luca Troger
+- Luiz Otavio Mello de Campos
+- Lyrnc
+- Maledetto
+- Marrqquess
+- Mumogg
+- Nixitov
+- Nostyxx
+- NuraadGit
+- Omeya Sawant
+- Rhuan Chaves
+- Ryx
+- Shayan Shahram Hassan Abdullah
+- SlopComp
+- Sunkiller-qc
+- Surya K
+- Tarcisio
+- Thiago
+- Thomas Askharoun
+- TurGangS
+- UwUCammie
+- ZazaJr24
+- alessiodeia
+- ashrafsdrop
+- b000m
+- bartikele
+- blueriverofficial01-prog
+- bodnjenie14
+- bvtterbroot
+- curnpoo
+- cxccxc
+- dadou000
+- divyeshganta
+- flapwarp78
+- fluffyflattershy-afk
+- gingertonik
+- gmanka
+- grindersky
+- heromike405-arch
+- imjustprism
+- ismailchaka1
+- itsRevela
+- itsyusei99
+- jsthope
+- julio
+- localshotgun
+- melon0918
+- mgunes1311-lab
+- moe-miau
+- myokex
+- nino-exe
+- oddiums
+- realhenners
+- talakasse
+- warmooff-ops

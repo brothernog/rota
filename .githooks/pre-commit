@@ -1,0 +1,19 @@
+#!/bin/sh
+# Enforces the asset policy on every commit. Install with: cargo xtask install-hooks
+
+# Optional, per clone: .git/info/deny-terms, one extended regex per line, checked
+# against the lines this commit adds. Skipped while merging, where the added
+# lines are other people's work.
+deny=$(git rev-parse --git-path info/deny-terms)
+if [ -f "$deny" ] && [ ! -f "$(git rev-parse --git-path MERGE_HEAD)" ]; then
+    pats=$(mktemp)
+    sed '/^#/d;/^[[:space:]]*$/d' "$deny" > "$pats"
+    hits=$(git diff --cached -U0 --no-color | grep '^+' | grep -v '^+++' | grep -i -c -E -f "$pats")
+    rm -f "$pats"
+    if [ "$hits" -gt 0 ]; then
+        echo "pre-commit: $hits added line(s) match a term in $deny" >&2
+        exit 1
+    fi
+fi
+
+exec cargo xtask policy --staged

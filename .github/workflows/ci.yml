@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      # The version and components pinned in rust-toolchain.toml.
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      # Not -D warnings yet: the imported code still has 37 warnings. New code adds none.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked
+      - name: Clippy, diagnostics build
+        run: cargo clippy --workspace --all-targets --all-features --locked
+      # Includes xtask's repository_passes_policy, the asset-policy check.
+      - name: Tests
+        run: cargo test --workspace --locked
