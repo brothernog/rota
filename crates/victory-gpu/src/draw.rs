@@ -2316,7 +2316,20 @@ impl State {
             // was shown four frames late, over and over.
             let mut again_in = RECHECK_FRAMES[0];
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
-                if crate::texture::fingerprint(at, len) == print {
+                // `VICTORY_HEAP_WORKER=1`: read on our thread; the slot
+                // stays due until a later pass has the answer.
+                let last = RECHECK_FRAMES.get(usize::from(looks) + 1).is_none();
+                let look = if crate::heap_worker::on() && !baking {
+                    crate::heap_worker::look(at, len, uploaded, frame, last)
+                } else {
+                    crate::heap_worker::Look::Here
+                };
+                let seen = match look {
+                    crate::heap_worker::Look::Print(seen) => seen,
+                    crate::heap_worker::Look::Later => continue,
+                    crate::heap_worker::Look::Here => crate::texture::fingerprint(at, len),
+                };
+                if seen == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
                         Some(wait) => {
