@@ -2367,14 +2367,10 @@ impl State {
             // had its colour only in the launches that entered the world
             // under the line. `VICTORY_REUPLOAD_WHEN_FULL=0`: refused, as
             // before.
-            let mut short = false;
             if !room {
                 let has_its_texture = reupload_when_full()
                     && heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle));
-                // `VICTORY_TEXTURE_SHORT=1`: a copy without its larger levels
-                // instead of waiting (adapted from LoverCatys/ruff-lab b3073ea9).
-                short = !has_its_texture && crate::resource::room_for_short();
-                if !has_its_texture && !short {
+                if !has_its_texture {
                     refused += 1;
                     if full_card_pass() {
                         // Held back for the frames of about four seconds
@@ -2398,7 +2394,6 @@ impl State {
                     );
                 }
             }
-            let _short = short.then(crate::resource::ShortOfRoom::begin);
             // A slot that shows the texture by an earlier view of it (one
             // from another level) goes on doing so until the upload of what
             // the new one shows has run.
