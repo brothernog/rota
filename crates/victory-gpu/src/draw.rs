@@ -2232,17 +2232,25 @@ impl State {
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
+        // Less when the PC is short of memory (`crate::residency`); not for
+        // a bake, which samples its inputs at once, or an asked-for budget.
+        let limit = |bytes| if baking || asked.is_some() { bytes } else { crate::residency::limit_prefetch(bytes) };
         let (span, bytes_at_most) = match PASS_BUDGET.get() {
             Some((ms, bytes)) => {
-                (std::time::Duration::from_millis(ms), SPENT.load(Ordering::Relaxed).saturating_add(bytes))
+                (std::time::Duration::from_millis(ms), SPENT.load(Ordering::Relaxed).saturating_add(limit(bytes)))
             }
-            None => (span, per_frame),
+            None => (span, limit(per_frame)),
         };
         let began = std::time::Instant::now();
         BAKE_SERVED.store(0, Ordering::Relaxed);
         let mut served = true;
         for (index, write) in due {
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
+                served = false;
+                break;
+            }
+            // Short of commit (`crate::residency`): the rest stays due.
+            if !crate::residency::admit_texture_pass(baking) {
                 served = false;
                 break;
             }
@@ -2485,9 +2493,16 @@ impl State {
             {
                 // (What was found mapped of it a moment ago is not asked
                 // again, unless the host copy may need more.)
+                let _ = crate::residency::take_staging_deferred();
                 crate::texture::PICKING.set(Some(there.filter(|_| partly.is_none()).unwrap_or(u64::MAX)));
                 readable(list, sampled.kind, view);
                 crate::texture::PICKING.set(None);
+                // A staging buffer refused (`crate::residency`) leaves the slot due:
+                // marking it served would lose its only retry.
+                if crate::residency::take_staging_deferred() || crate::residency::upload_refused() {
+                    served = false;
+                    break;
+                }
             }
             if shows_other && let Some(handle) = heap.handle(index) {
                 host.texture_slot_flip(list, index, handle);
