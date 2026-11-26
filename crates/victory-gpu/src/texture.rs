@@ -475,6 +475,11 @@ impl Drop for Staging {
     }
 }
 
+/// Bytes of the staging buffers alive ([`crate::residency`]).
+pub(crate) fn live_staging_bytes() -> u64 {
+    STAGED[1].load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// For the memory line: staging buffers alive, their bytes, and how many
 /// of them their texture still has (the others wait for a list's reset).
 #[cfg(feature = "diagnostics")]
@@ -1802,6 +1807,13 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     let (piece, buffer, base, data) = match crate::pool::staging(host, total) {
         Some((piece, buffer, base, data)) => (Some(piece), buffer, base, data),
         None => {
+            // A speculative upload gives way when the PC is short of memory
+            // ([`crate::residency`]); the slot stays due.
+            let speculative = PICKING.get().is_some() && !BAKING.get();
+            if crate::residency::upload_refused() || (speculative && !crate::residency::allow_staging_growth(false)) {
+                crate::residency::note_staging_deferred();
+                return None;
+            }
             let (buffer, data) = host.upload_buffer(total)?;
             crate::host::name(&buffer, || {
                 format!(

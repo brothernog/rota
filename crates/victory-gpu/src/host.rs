@@ -368,7 +368,12 @@ pub(crate) fn keep_freed() -> bool {
 /// when free physical RAM is low. Never returns less than 2,000 ms.
 /// With plenty of it five minutes ([`keep_freed`]).
 pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
-    ram_idle_for(avail_phys, keep_freed())
+    // With little commit left too ([`crate::residency`]), as with little memory.
+    let avail_phys = match (avail_phys, crate::residency::headroom()) {
+        (Some(a), Some(h)) => Some(a.min(h)),
+        (a, h) => a.or(h),
+    };
+    ram_idle_for(avail_phys, keep_freed() && !crate::residency::pressured())
 }
 
 fn ram_idle_for(avail_phys: Option<u64>, keep: bool) -> u64 {
@@ -432,6 +437,7 @@ fn sweep() {
     }
     #[cfg(feature = "diagnostics")]
     crate::book::check();
+    crate::residency::refresh();
     crate::pool::room(host().and_then(|h| h.video_memory()));
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
@@ -8447,6 +8453,7 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
+                crate::residency::allocation_error(&e);
                 tracing::warn!(error = %e, size, "no upload buffer");
                 None
             }
@@ -9030,6 +9037,7 @@ impl Meter {
                     per_frame(6) / 1e3
                 );
             }
+            crate::residency::log_stats();
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \

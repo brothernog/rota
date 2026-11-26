@@ -69,6 +69,8 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod memory;
 mod overlay;
+#[cfg(windows)]
+mod residency;
 mod pixels;
 #[cfg(windows)]
 mod shadow;
