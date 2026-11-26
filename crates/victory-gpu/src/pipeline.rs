@@ -342,36 +342,62 @@ fn names_are_found_by_hash() {
     assert_eq!(find_named(b"", &names), None);
 }
 
-/// Whether a compute container is one of the title's programs that pose
-/// every animated mesh (and its motion) once more, only for the ray-tracing
-/// structures. With every ray a miss (`VICTORY_RT_MISS=1`) and the structure
-/// builder off, nothing reads what they write, and they were the largest
-/// share of the card's time in a cutscene (~6 ms a dispatch, hundreds a
-/// frame).
+/// What a compute container does only for the ray-tracing structures, by
+/// its entry point's name (kept as hashes: the names are the title's). With
+/// every ray a miss (`VICTORY_RT_MISS=1`) and the structure builder off,
+/// nothing reads what these write:
+/// - `Skin`: 30 programs that pose every animated mesh (and its motion) once
+///   more, only for the structures; they were the largest share of the
+///   card's time in a cutscene (~6 ms a dispatch, hundreds a frame). The
+///   picture's own skinning programs and the cloth's have other names.
+/// - `Resolve`: some 1,000 programs that shade what a ray hit.
+/// - `Activate`: picks the screen probes that cast rays.
 ///
-/// The container holds its entry point's name: all 30 of them share one
-/// name start (17 bytes), which the picture's own skinning programs and the
-/// cloth's do not.
+/// The last two after codec-d/cool_fox `make.rs` (GPL-3.0-or-later).
 #[cfg(windows)]
-fn skins_for_rays(bytes: &[u8]) -> bool {
-    const NAME: Named = Named { lead: *b"CSC", len: 17, hash: 0x75d5_4989_f655_36c7 };
-    NAME.is_in(bytes)
+fn for_rays(bytes: &[u8]) -> RayOnly {
+    const NAMES: [Named; 3] = [
+        Named { lead: *b"CSC", len: 17, hash: 0x75d5_4989_f655_36c7 },
+        Named { lead: *b"CS_", len: 20, hash: 0x6854_1240_ea05_c84a },
+        Named { lead: *b"CS_", len: 28, hash: 0x4a10_5f92_c2a3_8ecc },
+    ];
+    find_named(bytes, &NAMES).map_or(RayOnly::No, |i| [RayOnly::Skin, RayOnly::Resolve, RayOnly::Activate][i])
 }
 
-/// Whether a dispatch of `this` is left out because it only feeds the
-/// ray-tracing structures, which nothing walks: every ray is a miss
-/// (`VICTORY_RT_MISS=1`) and the builder is off. `VICTORY_RT_SKIN=1` runs
-/// them anyway.
+/// What a compute pipeline does only for rays ([`for_rays`]).
+#[cfg(windows)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RayOnly {
+    No,
+    Skin,
+    Resolve,
+    Activate,
+}
+
+/// Whether a dispatch of `this` is left out because it only serves rays,
+/// and nothing they could hit is there: every ray is a miss
+/// (`VICTORY_RT_MISS=1`) and the structure builder is off. Each kind runs
+/// anyway with its switch: `VICTORY_RT_SKIN=1`, `VICTORY_RT_RESOLVE=1`,
+/// `VICTORY_ACTIVATE_RAYS=1`.
 #[cfg(windows)]
 pub(crate) fn skips_rt_skin(this: This) -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    !this.is_null()
-        && pipeline(this).rt_skin
-        && *ON.get_or_init(|| {
-            victory_shader::emit::rt_miss()
-                && std::env::var_os("VICTORY_BVH_BUILDER").is_none_or(|v| v != "1")
-                && std::env::var_os("VICTORY_RT_SKIN").is_none_or(|v| v != "1")
-        })
+    fn off(switch: &str) -> bool {
+        victory_shader::emit::rt_miss()
+            && std::env::var_os("VICTORY_BVH_BUILDER").is_none_or(|v| v != "1")
+            && std::env::var_os(switch).is_none_or(|v| v != "1")
+    }
+    static SKIN: OnceLock<bool> = OnceLock::new();
+    static RESOLVE: OnceLock<bool> = OnceLock::new();
+    static ACTIVATE: OnceLock<bool> = OnceLock::new();
+    if this.is_null() {
+        return false;
+    }
+    match pipeline(this).rt_only {
+        RayOnly::No => false,
+        RayOnly::Skin => *SKIN.get_or_init(|| off("VICTORY_RT_SKIN")),
+        RayOnly::Resolve => *RESOLVE.get_or_init(|| off("VICTORY_RT_RESOLVE")),
+        RayOnly::Activate => *ACTIVATE.get_or_init(|| off("VICTORY_ACTIVATE_RAYS")),
+    }
 }
 
 /// `VICTORY_BVH_QUARANTINE=1`: what the structure builder's stages store
@@ -502,10 +528,10 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
-    /// One of the title's skinning passes for the ray-tracing structures
-    /// ([`skins_for_rays`]).
+    /// One of the title's passes that only serve rays
+    /// ([`for_rays`]).
     #[cfg(windows)]
-    rt_skin: bool,
+    rt_only: RayOnly,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -674,7 +700,7 @@ fn hand_out(
         #[cfg(windows)]
         builder,
         #[cfg(windows)]
-        rt_skin: shaders.iter().any(|s| s.stage == "compute" && skins_for_rays(&s.container)),
+        rt_only: shaders.iter().filter(|s| s.stage == "compute").map(|s| for_rays(&s.container)).find(|k| *k != RayOnly::No).unwrap_or(RayOnly::No),
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
