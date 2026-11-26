@@ -4082,8 +4082,9 @@ fn make_twinned(
                 }
                 if copy.base > 0
                     && let Some(desc) = &mut desc
+                    && !from_base(desc, copy.base)
                 {
-                    from_base(desc, copy.base);
+                    return None;
                 }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
@@ -4221,19 +4222,32 @@ fn make_twinned(
 
 /// The view `desc` of a texture, of a host copy of its levels from `base`
 /// on (`crate::resource::held_only`). What it shows of larger ones, if any,
-/// is left out.
-fn from_base(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, base: u32) {
-    if desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D {
-        return;
-    }
+/// is left out (a view of those alone shows the copy's level 0). False for
+/// a view of another dimension, which such a copy cannot be shown by: a
+/// 2D texture of one layer, viewed as one or as an array of one (the
+/// array view was passed as it was, naming levels the copy has not).
+fn from_base(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, base: u32) -> bool {
     // SAFETY: the member its dimension says.
-    let t = unsafe { &mut desc.Anonymous.Texture2D };
-    let lost = base.saturating_sub(t.MostDetailedMip);
-    t.MostDetailedMip = t.MostDetailedMip.saturating_sub(base);
-    if t.MipLevels != u32::MAX {
-        t.MipLevels = t.MipLevels.saturating_sub(lost).max(1);
+    let (first, levels, clamp) = unsafe {
+        match desc.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE2D => {
+                let t = &mut desc.Anonymous.Texture2D;
+                (&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp)
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+                let t = &mut desc.Anonymous.Texture2DArray;
+                (&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp)
+            }
+            _ => return false,
+        }
+    };
+    let lost = base.saturating_sub(*first);
+    *first = first.saturating_sub(base);
+    if *levels != u32::MAX {
+        *levels = levels.saturating_sub(lost).max(1);
     }
-    t.ResourceMinLODClamp = (t.ResourceMinLODClamp - base as f32).max(0.0);
+    *clamp = (*clamp - base as f32).max(0.0);
+    true
 }
 
 /// Writes of a slot with another view of the placed texture it showed,
@@ -4789,6 +4803,60 @@ mod tests {
         assert_eq!(view(1, 4, 0.0), (0, 2, 0.0));
     }
 
+    /// Whatever levels a view of the title's names, the view of a host copy
+    /// from `base` on names only levels the copy has, at least one, as a 2D
+    /// view or an array view (`VICTORY_TEXTURE_DROP_MIPS`); views of other
+    /// dimensions are refused.
+    #[test]
+    fn views_of_a_shorter_copy_name_only_its_levels() {
+        const TEXTURE2D: u32 = 4;
+        const TEXTURE2DARRAY: u32 = 5;
+        for dimension in [TEXTURE2D, TEXTURE2DARRAY] {
+            for mips in 1..=14u32 {
+                for base in 0..mips {
+                    for first in 0..mips {
+                        for levels in (1..=mips - first).chain([u32::MAX]) {
+                            // (Word 7 is the array size of an array view, the clamp of a 2D one.)
+                            let size = u32::from(dimension == TEXTURE2DARRAY);
+                            let mut desc = srv_desc(&[98, dimension, 5768, 0, first, levels, 0, size, 0, 0]);
+                            assert!(from_base(&mut desc, base));
+                            // SAFETY: the member its dimension says.
+                            let (f, l, clamp) = unsafe {
+                                if dimension == TEXTURE2D {
+                                    let t = desc.Anonymous.Texture2D;
+                                    (t.MostDetailedMip, t.MipLevels, t.ResourceMinLODClamp)
+                                } else {
+                                    let t = desc.Anonymous.Texture2DArray;
+                                    assert_eq!((t.FirstArraySlice, t.ArraySize), (0, 1));
+                                    (t.MostDetailedMip, t.MipLevels, t.ResourceMinLODClamp)
+                                }
+                            };
+                            let has = mips - base;
+                            assert!(f < has, "{dimension} {mips} {base} {first} {levels}");
+                            assert!(l == u32::MAX || (l >= 1 && f + l <= has), "{dimension} {mips} {base} {first} {levels}");
+                            assert!(clamp >= 0.0);
+                        }
+                    }
+                }
+            }
+        }
+        // A view of the dropped levels alone shows the copy's first level;
+        // one of the last level, the copy's last.
+        let first_levels = |dimension, first, levels, base| {
+            let mut desc = srv_desc(&[98, dimension, 5768, 0, first, levels, 0, 1, 0, 0]);
+            assert!(from_base(&mut desc, base));
+            // SAFETY: both members begin with these two fields.
+            let t = unsafe { desc.Anonymous.Texture2D };
+            (t.MostDetailedMip, t.MipLevels)
+        };
+        assert_eq!(first_levels(TEXTURE2D, 0, 2, 2), (0, 1));
+        assert_eq!(first_levels(TEXTURE2DARRAY, 1, 1, 2), (0, 1));
+        assert_eq!(first_levels(TEXTURE2DARRAY, 9, 1, 2), (7, 1));
+        // A cube or 3D view cannot show such a copy.
+        let mut cube = srv_desc(&[98, 9, 5768, 0, 0, 1, 0, 0, 0, 0]);
+        assert!(!from_base(&mut cube, 1));
+    }
+
     /// 2D textures and arrays have a neutral stand-in, others a null view.
     #[test]
     fn a_texture_not_there_yet_has_a_neutral_stand_in() {
@@ -5170,6 +5238,63 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         unsafe { host.device.CreateShaderResourceView(texture, None, heap.cpu(0)) };
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// `VICTORY_TEXTURE_DROP_MIPS=2`: the host copy of a placed 1024x1024
+    /// texture starts at level 2 and stays so when a view of level 0 comes,
+    /// and 2D and array views of any of the title's levels are made without
+    /// a debug layer error (a view naming a level the copy has not makes
+    /// one, checked first).
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    #[ignore = "wants VICTORY_TEXTURE_DROP_MIPS=2 VICTORY_D3D12_DEBUG=1 and a process of its own"]
+    fn views_of_a_copy_without_its_largest_levels_are_valid() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        let Some(host) = host() else { return };
+        let heap = HostHeap::new(false, 4).expect("a heap");
+        // 1024x1024 BC7, eleven levels.
+        let desc = [3u32, 0, 0, 0, 1024, 0, 1024, 0xb_0001, 98, 1, 0, 0x105, 0, 0];
+        let whole = crate::resource::placed_bytes(&desc).unwrap() as usize;
+        // SAFETY: memory of our own that stays.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), whole, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        let texture = crate::resource::texture_at(at as u64, &desc).unwrap();
+        let copy = crate::resource::host_copy(texture).unwrap();
+        // SAFETY: a live texture.
+        let d = unsafe { copy.texture.GetDesc() };
+        assert_eq!((copy.base, d.Width, d.MipLevels), (2, 256, 9));
+        crate::resource::want_level(texture, 0);
+        assert_eq!(crate::resource::host_copy(texture).unwrap().serial, copy.serial);
+        // (Errors are told only with the debug layer installed; without it,
+        // a wrong view removes the device here, which is checked after.)
+        let _ = host.log_messages();
+        for dimension in [4u32, 5] {
+            for first in 0..11 {
+                for levels in [1, 11 - first, u32::MAX] {
+                    let size = u32::from(dimension == 5);
+                    let view = View::Shader(texture as usize, Some([98, dimension, 5768, 0, first, levels, 0, size, 0, 0]));
+                    assert!(make(&view, heap.cpu(0)).is_some(), "{dimension} {first} {levels}");
+                    assert_eq!(host.log_messages(), None, "{dimension} {first} {levels}");
+                }
+            }
+        }
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        // The check checks: the array view as the title gave it, eleven
+        // levels of a copy of nine, is an error (or removes the device).
+        let bad = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_BC7_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+            Shader4ComponentMapping: 5768,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2DArray: D3D12_TEX2D_ARRAY_SRV { MipLevels: 11, ArraySize: 1, ..Default::default() },
+            },
+        };
+        // SAFETY: a slot of our heap and a live texture; the view is wrong
+        // on purpose, the last thing this process does with the device.
+        unsafe { host.device.CreateShaderResourceView(&copy.texture, Some(&bad), heap.cpu(0)) };
+        // SAFETY: a plain device query.
+        let removed = unsafe { host.device.GetDeviceRemovedReason() }.is_err();
+        assert!(host.log_messages().is_some() || removed, "a wrong view went unnoticed");
     }
 
 
