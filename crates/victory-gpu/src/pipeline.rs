@@ -354,14 +354,35 @@ fn names_are_found_by_hash() {
 /// - `Activate`: picks the screen probes that cast rays.
 ///
 /// The last two after codec-d/cool_fox `make.rs` (GPL-3.0-or-later).
+///
+/// `Trace`: the tracing itself against the structures, and the hair's
+/// geometry made for them (8 % of the card's time in upstream's cutscene
+/// run). The tracing programs' fallback forms march through the title's
+/// voxels instead and light the picture, so they run.
 #[cfg(windows)]
 fn for_rays(bytes: &[u8]) -> RayOnly {
-    const NAMES: [Named; 3] = [
+    const NAMES: [Named; 8] = [
         Named { lead: *b"CSC", len: 17, hash: 0x75d5_4989_f655_36c7 },
+        Named { lead: *b"CSG", len: 16, hash: 0x88d5_868b_21ac_f0a8 },
         Named { lead: *b"CS_", len: 20, hash: 0x6854_1240_ea05_c84a },
         Named { lead: *b"CS_", len: 28, hash: 0x4a10_5f92_c2a3_8ecc },
+        Named { lead: *b"CS_", len: 25, hash: 0x1e6f_daa9_5ff4_fecc },
+        Named { lead: *b"_BV", len: 4, hash: 0x2f04_bb42_f945_4ada },
+        Named { lead: *b"CS_", len: 18, hash: 0x5e61_2445_d69c_1403 },
+        Named { lead: *b"Vox", len: 6, hash: 0x215e_0fd8_d761_edac },
     ];
-    find_named(bytes, &NAMES).map_or(RayOnly::No, |i| [RayOnly::Skin, RayOnly::Resolve, RayOnly::Activate][i])
+    let has = |i: usize| NAMES[i].is_in(bytes);
+    if has(0) || has(1) {
+        RayOnly::Skin
+    } else if has(2) {
+        RayOnly::Resolve
+    } else if has(3) {
+        RayOnly::Activate
+    } else if (has(4) && has(5)) || (has(6) && !has(7)) {
+        RayOnly::Trace
+    } else {
+        RayOnly::No
+    }
 }
 
 /// What a compute pipeline does only for rays ([`for_rays`]).
@@ -372,12 +393,13 @@ enum RayOnly {
     Skin,
     Resolve,
     Activate,
+    Trace,
 }
 
 /// Whether a dispatch of `this` is left out because it only serves rays,
 /// and nothing they could hit is there: every ray is a miss
 /// (`VICTORY_RT_MISS=1`) and the structure builder is off. Each kind runs
-/// anyway with its switch: `VICTORY_RT_SKIN=1`, `VICTORY_RT_RESOLVE=1`,
+/// anyway with its switch: `VICTORY_RT_SKIN=1`, `VICTORY_RT_RESOLVE=1`, `VICTORY_RT_TRACE=1`,
 /// `VICTORY_ACTIVATE_RAYS=1`.
 #[cfg(windows)]
 pub(crate) fn skips_rt_skin(this: This) -> bool {
@@ -389,6 +411,7 @@ pub(crate) fn skips_rt_skin(this: This) -> bool {
     static SKIN: OnceLock<bool> = OnceLock::new();
     static RESOLVE: OnceLock<bool> = OnceLock::new();
     static ACTIVATE: OnceLock<bool> = OnceLock::new();
+    static TRACE: OnceLock<bool> = OnceLock::new();
     if this.is_null() {
         return false;
     }
@@ -397,6 +420,7 @@ pub(crate) fn skips_rt_skin(this: This) -> bool {
         RayOnly::Skin => *SKIN.get_or_init(|| off("VICTORY_RT_SKIN")),
         RayOnly::Resolve => *RESOLVE.get_or_init(|| off("VICTORY_RT_RESOLVE")),
         RayOnly::Activate => *ACTIVATE.get_or_init(|| off("VICTORY_ACTIVATE_RAYS")),
+        RayOnly::Trace => *TRACE.get_or_init(|| off("VICTORY_RT_TRACE")),
     }
 }
 
