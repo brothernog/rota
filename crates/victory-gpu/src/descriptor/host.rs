@@ -5277,6 +5277,16 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
                 }
             }
         }
+        // An upload for a view of level 0 fills the copy from its level 0,
+        // the title's level 2.
+        let list = host.new_list().unwrap();
+        list.close();
+        list.reset();
+        crate::texture::upload_from(&list, texture, 0);
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(crate::texture::staged_from(texture), 2);
+        assert_eq!(host.log_messages(), None);
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
         // The check checks: the array view as the title gave it, eleven

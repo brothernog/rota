@@ -1388,17 +1388,14 @@ pub(crate) fn want_level(this: This, first: u32) {
         r.host.wanted.fetch_min(first, Relaxed);
         return;
     };
-    if host.base == 0 {
+    if host.base == 0 || host.base <= base_level(&r.desc, first) {
         return;
     }
     // The same floor as `hosted`: levels dropped for good are not wanted,
     // except by the copy of a texture found to alias another later
     // (`crate::texture::alias`), which needs them all.
-    let drop = match drop_levels(&r.desc) {
-        0 => 0,
-        n => if alias_of(this).is_none() { n } else { 0 },
-    };
-    if host.base <= base_level(&r.desc, first.max(drop)) {
+    let drop = drop_levels(&r.desc);
+    if drop > 0 && host.base <= base_level(&r.desc, first.max(drop)) && alias_of(this).is_none() {
         return;
     }
     r.host.wanted.store(first, Relaxed);

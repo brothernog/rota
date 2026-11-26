@@ -1595,7 +1595,7 @@ pub(crate) fn staged_state(resource: This) -> Option<(bool, bool)> {
 
 /// The first level a title texture's staging buffer holds; `u32::MAX`
 /// without one.
-fn staged_from(resource: This) -> u32 {
+pub(crate) fn staged_from(resource: This) -> u32 {
     let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     map.as_ref()
         .and_then(|map| map.get(&(resource as usize)))
