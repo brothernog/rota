@@ -1978,6 +1978,8 @@ struct CardWork {
     taken: u32,
     /// Plans made and not done with (`Host::card_done`).
     out: u32,
+    /// With `VICTORY_CARD_RING` ([`ring`]).
+    ring: Option<ring::CardRing>,
 }
 
 // SAFETY: D3D12 objects (free-threaded) and persistent mappings, used only
@@ -1998,8 +2000,17 @@ static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
 /// walked the piece before, 4,096 steps; the passes took 24.8 ms of a frame's
 /// 82 on the card (capture replay1, 405 of them), most of it waiting for
 /// those steps.
+///
+/// With `CARD_RING` defined (`ring`, `VICTORY_CARD_RING`): mode 3 is mode 2,
+/// and a flagged piece is also copied whole (as hashed) into a slot of the
+/// ring, whose number goes to the ring's index at the piece's dword.
+/// Without it the source is as it was.
 pub(crate) const CARD_COMPARE: &str = r#"
+#ifdef CARD_RING
+#define RS "RootConstants(num32BitConstants=8, b0), SRV(t0), UAV(u0), UAV(u1), UAV(u2), UAV(u3)"
+#else
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
+#endif
 cbuffer Span : register(b0) {
     uint first;    // the first piece
     uint skew;     // where the copy starts in its piece 0
@@ -2007,12 +2018,24 @@ cbuffer Span : register(b0) {
     uint pieces;
     uint out_at;   // the first piece's dword in `differs`, in bytes
     uint compare;  // 0: the hashes are stored; else compared with those stored (2: and then stored)
+#ifdef CARD_RING
+    uint tail;     // the first slot number not landed yet (31 bits)
+    uint slots;    // the ring's slots, a power of two
+#endif
 };
 ByteAddressBuffer now : register(t0);
 // 16 bytes per piece of the copy: the hash of its bytes when they were
 // last sent up (or hashed whole, the first time).
 RWByteAddressBuffer hashes : register(u0);
 RWByteAddressBuffer differs : register(u1);
+#ifdef CARD_RING
+// 1 MiB of index (a dword per piece, as `differs`: the slot number, the top
+// bit set where it did not fit), then the slots.
+RWByteAddressBuffer ring : register(u2);
+// The next slot number.
+RWByteAddressBuffer counter : register(u3);
+groupshared uint dest;
+#endif
 groupshared uint4 parts[64];
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
@@ -2060,7 +2083,13 @@ void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
     }
     parts[thread] = h;
     GroupMemoryBarrierWithGroupSync();
+#ifdef CARD_RING
+    // (No return: the copy below waits for this thread.)
+    if (thread == 0u) {
+    dest = 0xFFFFFFFFu;
+#else
     if (thread != 0u) return;
+#endif
     h = parts[0];
     [loop]
     for (uint i = 1u; i < 64u; ++i) {
@@ -2070,15 +2099,52 @@ void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
     if (compare != 0u) {
         // The flag, and above it 31 bits of the hash (`torn`).
         uint folded = h.x ^ (h.y * 3u) ^ (h.z * 5u) ^ (h.w * 7u);
+#ifdef CARD_RING
+        // Read once: another pass at the piece may store its hash between
+        // two reads, and the flag and the slot would disagree.
+        bool differed = any(h != hashes.Load4(piece * 16u));
+        differs.Store(out_at + id.x * 4u, (folded << 1u) | (differed ? 1u : 0u));
+#else
         differs.Store(out_at + id.x * 4u, (folded << 1u) | (any(h != hashes.Load4(piece * 16u)) ? 1u : 0u));
+#endif
         // With the copy-back on its own thread: the next compare of the
         // piece finds what is written from here on.
+#ifdef CARD_RING
+        if (compare == 3u) {
+            if (differed) {
+                uint s;
+                counter.InterlockedAdd(0, 1u, s);
+                s &= 0x7FFFFFFFu;
+                bool fits = ((s - tail) & 0x7FFFFFFFu) < slots;
+                ring.Store(out_at + id.x * 4u, fits ? s : (s | 0x80000000u));
+                if (fits) dest = 1048576u + (s & (slots - 1u)) * 65600u;
+            }
+            hashes.Store4(piece * 16u, h);
+        }
+#endif
         if (compare == 2u) hashes.Store4(piece * 16u, h);
     } else {
         hashes.Store4(piece * 16u, h);
     }
+#ifdef CARD_RING
+    }
+    GroupMemoryBarrierWithGroupSync();
+    uint to = dest;
+    if (to != 0xFFFFFFFFu) {
+        // The bytes just hashed, by the same threads in the same steps.
+        [loop]
+        for (at = lo + thread * 16u; at < hi; at += 1024u) {
+            ring.Store4(to + (at - lo), now.Load4(at));
+        }
+    }
+#endif
 }
 "#;
+
+/// [`CARD_COMPARE`] with the ring ([`ring`]).
+pub(crate) fn card_compare_ring() -> String {
+    format!("#define CARD_RING 1\n{CARD_COMPARE}")
+}
 
 /// The hash [`CARD_COMPARE`] gives of a piece with its flag.
 #[cfg(test)]
@@ -2092,16 +2158,19 @@ pub(crate) fn piece_hash(bytes: &[u8]) -> u32 {
 ///
 /// # Safety
 /// The list is open with the compare's root signature, pipeline and buffers
-/// set, and the pieces lie in the buffer.
-unsafe fn card_pass(list: &ID3D12GraphicsCommandList, span: &crate::shadow::CardSpan, size: u32, at: u32, mode: u32) {
+/// set, and the pieces lie in the buffer. With `ring` (its tail and slots),
+/// those of the compare with the ring.
+unsafe fn card_pass(list: &ID3D12GraphicsCommandList, span: &crate::shadow::CardSpan, size: u32, at: u32, mode: u32, ring: Option<(u32, u32)>) {
     const MOST: u32 = D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION;
+    let (tail, slots) = ring.unwrap_or_default();
+    let count = if ring.is_some() { 8 } else { 6 };
     let mut done = 0;
     while done < span.pieces {
         let n = (span.pieces - done).min(MOST);
-        let constants = [span.first + done, span.skew, size, n, (at + done) * 4, mode];
+        let constants = [span.first + done, span.skew, size, n, (at + done) * 4, mode, tail, slots];
         // SAFETY: the caller's.
         unsafe {
-            list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+            list.SetComputeRoot32BitConstants(0, count, constants.as_ptr().cast(), 0);
             list.Dispatch(n, 1, 1);
         }
         done += n;
@@ -2188,6 +2257,9 @@ struct CardPlan {
     looks: Option<upcheck::Looks>,
     /// With [`send`]: the memory its sends come from.
     sends: Option<send::Memory>,
+    /// With [`ring`]: its compare put pieces in the ring, and was timed
+    /// with this pair of timestamps.
+    ring: Option<u32>,
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -2524,6 +2596,82 @@ static RELAY_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atom
 /// flight (its bottom-of-pipe writes, signals) never before the flight.
 fn landable(line: &[Option<u64>], completed: u64) -> usize {
     line.iter().position(|f| f.is_some_and(|f| f > completed)).unwrap_or(line.len())
+}
+
+/// What shaders wrote to copies in the card's memory goes into title memory
+/// ([`Host::relay_card_back`]): `pieces` are the parts landed (copy, from,
+/// to, where their bytes are from `data` on), and title bytes sent after
+/// send `after` are left out. With `check` (`torn`), each part's piece is
+/// looked at first. Returns the bytes put into title memory.
+///
+/// # Safety
+/// `data` is mapped and holds every part's bytes, which stay as they are
+/// during the call.
+unsafe fn land_pieces(pieces: &[torn::Landed], data: usize, after: u64, check: Option<&torn::Check>) -> u64 {
+    use crate::land;
+    // `VICTORY_TORN_HOLD`: the pieces flights still in the air may write.
+    let in_air = match check {
+        Some(_) if torn::hold() => torn::declared(&line().line),
+        _ => std::collections::HashSet::new(),
+    };
+    // Whether part `i` is merged now (after its piece was looked at).
+    let keep = |i: usize| {
+        let held = check.is_some_and(|c| torn::held(c.torn(i), c.piece(i), &in_air));
+        if held {
+            torn::HELD.fetch_add(1, Ordering::Relaxed);
+        }
+        !held
+    };
+    let mut written = 0;
+    if land::on() {
+        let titles: Vec<(usize, usize)> =
+            pieces.iter().map(|(shadow, lo, hi, _)| (shadow.span().0 as usize + lo, hi - lo)).collect();
+        let jobs = land::jobs(&titles);
+        let put = std::sync::atomic::AtomicU64::new(0);
+        land::each(jobs.len(), &|j| {
+            let working = std::time::Instant::now();
+            if let Some(check) = check {
+                for i in jobs[j].clone() {
+                    // SAFETY: as below.
+                    unsafe { check.look(i, data) };
+                }
+            }
+            let mut notes = land::Notes::default();
+            let parts: Vec<usize> = jobs[j].clone().filter(|&i| keep(i)).collect();
+            for run in parts.chunk_by(|&a, &b| std::sync::Arc::ptr_eq(&pieces[a].0, &pieces[b].0)) {
+                let addressed: Vec<(usize, usize, usize)> = run
+                    .iter()
+                    .map(|&i| {
+                        let (_, lo, hi, at) = &pieces[i];
+                        (*lo, *hi, data + *at as usize)
+                    })
+                    .collect();
+                // SAFETY: the caller's.
+                put.fetch_add(unsafe { pieces[run[0]].0.land_card(&addressed, after, &mut notes) }, Ordering::Relaxed);
+            }
+            notes.flush();
+            land::spent(land::stat::CARD_ALL, working);
+        });
+        land::count(land::stat::JOBS, jobs.len() as u64);
+        written = put.into_inner();
+    } else {
+        let mut title = Vec::new();
+        for (i, (shadow, lo, hi, at)) in pieces.iter().enumerate() {
+            if let Some(check) = check {
+                // SAFETY: as below.
+                unsafe { check.look(i, data) };
+            }
+            if !keep(i) {
+                continue;
+            }
+            // SAFETY: the caller's.
+            let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
+            let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
+            shadow.walls_merged(gpu.len(), merged);
+            written += merged as u64;
+        }
+    }
+    written
 }
 
 /// For one plan of copies in the card's memory, with [`relay`]: `flags`
@@ -3642,6 +3790,25 @@ fn late_line(frames: f64) {
                 held,
             );
         }
+        if ring::mode() != 0 {
+            // (Did not fit, and not what the compare hashed: counts, not per frame, so that one shows.)
+            let n: Vec<u64> = ring::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed)).collect();
+            let t: Vec<f64> = n.iter().map(|&n| n as f64 / frames).collect();
+            tracing::info!(
+                "card ring per frame (VICTORY_CARD_RING=3, the shadow: landing still fetches): {:.1} pieces, {:.1} MB in the ring; \
+                 {} pieces did not fit and {} were not what the compare hashed (0 expected) since the last line; \
+                 {:.1} fetched parts looked for in the ring, {:.2} of them not as the ring has them (the fetch runs later, \
+                 a later flight's bytes may be in it); compares with the ring {:.2} ms on the card ({:.1} timed)",
+                t[0],
+                t[1] / (1 << 20) as f64,
+                n[2],
+                n[3],
+                t[4],
+                t[5],
+                t[6] / 1e6,
+                t[7],
+            );
+        }
     }
     crate::land::log(frames);
     if place::on() {
@@ -3687,6 +3854,7 @@ pub(crate) mod indirects;
 mod panel;
 mod place;
 pub(crate) mod rank;
+mod ring;
 mod send;
 pub(crate) use send::{goes_as_words, words_under};
 #[cfg(feature = "diagnostics")]
@@ -4231,6 +4399,41 @@ impl Host {
     }
 
     fn make_card_work(&self) -> windows::core::Result<CardWork> {
+        let (root, pso) = self.make_compare(CARD_COMPARE)?;
+        #[cfg(feature = "diagnostics")]
+        name(&pso, || crate::replay::play::COMPARE.into());
+        let list = || self.make_prelude().ok_or_else(windows::core::Error::empty);
+        // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
+        // in one submission.
+        const RESULTS: u64 = 1 << 20;
+        let (differs, data) = self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
+        name(&differs, || "card compare results".into());
+        // (Only flights of the relay use it.)
+        let ring = match ring::mode() {
+            0 => None,
+            _ if !relay() => None,
+            _ => self
+                .make_card_ring()
+                .inspect_err(|e| tracing::warn!(error = %e, "no card ring (VICTORY_CARD_RING): it could not be made"))
+                .ok(),
+        };
+        Ok(CardWork {
+            sync: vec![list()?],
+            check: vec![list()?],
+            fetch: list()?,
+            root,
+            pso,
+            differs: (differs, data as usize, RESULTS),
+            fetched: None,
+            taken: 0,
+            out: 0,
+            ring,
+        })
+    }
+
+    /// The compare's root signature (inside the shader) and pipeline, from
+    /// `source`.
+    fn make_compare(&self, source: &str) -> windows::core::Result<(ID3D12RootSignature, ID3D12PipelineState)> {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
         let mut code: Option<ID3DBlob> = None;
@@ -4238,8 +4441,8 @@ impl Host {
         // pointer is ours.
         unsafe {
             D3DCompile(
-                CARD_COMPARE.as_ptr().cast(),
-                CARD_COMPARE.len(),
+                source.as_ptr().cast(),
+                source.len(),
                 windows::core::s!("card compare"),
                 None,
                 None,
@@ -4252,12 +4455,6 @@ impl Host {
             )?;
         }
         let code = code.ok_or_else(windows::core::Error::empty)?;
-        let list = || self.make_prelude().ok_or_else(windows::core::Error::empty);
-        // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
-        // in one submission.
-        const RESULTS: u64 = 1 << 20;
-        let (differs, data) = self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
-        name(&differs, || "card compare results".into());
         // SAFETY: the blob's own bytes; the root signature is inside the
         // shader.
         unsafe {
@@ -4271,19 +4468,7 @@ impl Host {
                 },
                 ..Default::default()
             })?;
-            #[cfg(feature = "diagnostics")]
-            name(&pso, || crate::replay::play::COMPARE.into());
-            Ok(CardWork {
-                sync: vec![list()?],
-                check: vec![list()?],
-                fetch: list()?,
-                root,
-                pso,
-                differs: (differs, data as usize, RESULTS),
-                fetched: None,
-                taken: 0,
-                out: 0,
-            })
+            Ok((root, pso))
         }
     }
 
@@ -4432,7 +4617,7 @@ impl Host {
                         CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
                         for run in runs {
-                            card_pass(list, &run, size as u32, 0, 0);
+                            card_pass(list, &run, size as u32, 0, 0, None);
                         }
                     }
                     list.Close()?;
@@ -4454,6 +4639,7 @@ impl Host {
             sent_as,
             looks,
             sends: own.map(send::Own::memory),
+            ring: None,
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
@@ -4510,6 +4696,9 @@ impl Host {
                 fail(format_args!("no host list for the compare of host copies in the card's memory"));
             };
             let (allocator, list) = &check;
+            // A flight's compare also puts what it flags in the ring.
+            let stamp = if flown { work.ring.as_mut().map(ring::CardRing::stamp) } else { None };
+            let ring = work.ring.as_ref().filter(|_| stamp.is_some());
             // SAFETY: the list's last run finished (its submission was
             // waited for, and it came back after that); live buffers; the
             // compare's own root signature.
@@ -4527,9 +4716,14 @@ impl Host {
                             }),
                         },
                     }]);
-                    list.SetComputeRootSignature(&work.root);
-                    list.SetPipelineState(&work.pso);
+                    let (root, pso) = ring.map_or((&work.root, &work.pso), |ring| (&ring.root, &ring.pso));
+                    list.SetComputeRootSignature(root);
+                    list.SetPipelineState(pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                    if let (Some(ring), Some(stamp)) = (ring, stamp) {
+                        ring.begin(list, stamp);
+                    }
+                    let told = ring.map(ring::CardRing::told);
                     for r in plan.ranges.iter().filter(|r| r.compared) {
                         let (Some((_, Some(before), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) else {
                             continue;
@@ -4538,13 +4732,22 @@ impl Host {
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
                         // (What is only looked at keeps its hashes: what
                         // changed there is the next declared range's to land.)
-                        card_pass(list, &r.span, size as u32, r.at, if flown && !r.picked { 2 } else { 1 });
+                        let mode = match (flown && !r.picked, told) {
+                            (false, _) => 1,
+                            (true, None) => 2,
+                            (true, Some(_)) => 3,
+                        };
+                        card_pass(list, &r.span, size as u32, r.at, mode, told);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
+                    }
+                    if let (Some(ring), Some(stamp)) = (ring, stamp) {
+                        ring.end(list, stamp);
                     }
                     list.Close()?;
                     list.cast()
                 })()
             };
+            plan.ring = stamp;
             match recorded {
                 Ok(list) => plan.check = Some(list),
                 Err(e) => fail(format_args!("the compare of host copies in the card's memory could not be recorded ({e})")),
@@ -4662,6 +4865,8 @@ impl Host {
         // have run, and their dwords are given to no other plan before these
         // are done with (`card_done`).
         let differs = differs.map(|(differs, dwords)| unsafe { std::slice::from_raw_parts(differs as *const u32, dwords) });
+        // `VICTORY_CARD_RING=3`: what the compares put in the ring, checked.
+        let ring = differs.and_then(|differs| ring::look(plans, differs));
         if let Some(differs) = differs {
             // Pieces caught while a later flight was at them (`torn`).
             let suspects = fetch.as_ref().map(|f| &f.suspects);
@@ -4754,6 +4959,9 @@ impl Host {
                 false => *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()),
             };
             crate::shadow::relay_fetched(after);
+            if let Some(ring) = ring {
+                ring.done();
+            }
             return;
         }
         let Some(f) = fetch.as_mut() else {
@@ -4828,73 +5036,16 @@ impl Host {
             CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
             CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
         }
+        if let Some(ring) = &ring {
+            // SAFETY: the mapping of the fetched bytes, as `pieces` say; the
+            // copy into it has run.
+            unsafe { ring.against(&pieces, data) };
+        }
         let merging = std::time::Instant::now();
         let _merging = crate::timeline::span("landing: merging fetched pieces");
-        // `VICTORY_TORN_HOLD`: the pieces flights still in the air may write.
-        let in_air = match &check {
-            Some(_) if torn::hold() => torn::declared(&line().line),
-            _ => std::collections::HashSet::new(),
-        };
-        // Whether part `i` is merged now (after its piece was looked at).
-        let keep = |i: usize| {
-            let held = check.as_ref().is_some_and(|c| torn::held(c.torn(i), c.piece(i), &in_air));
-            if held {
-                torn::HELD.fetch_add(1, Ordering::Relaxed);
-            }
-            !held
-        };
-        let mut written = 0;
-        if land::on() {
-            let titles: Vec<(usize, usize)> =
-                pieces.iter().map(|(shadow, lo, hi, _)| (shadow.span().0 as usize + lo, hi - lo)).collect();
-            let jobs = land::jobs(&titles);
-            let put = std::sync::atomic::AtomicU64::new(0);
-            land::each(jobs.len(), &|j| {
-                let working = std::time::Instant::now();
-                if let Some(check) = &check {
-                    for i in jobs[j].clone() {
-                        // SAFETY: as below.
-                        unsafe { check.look(i, data) };
-                    }
-                }
-                let mut notes = land::Notes::default();
-                let parts: Vec<usize> = jobs[j].clone().filter(|&i| keep(i)).collect();
-                for run in parts.chunk_by(|&a, &b| std::sync::Arc::ptr_eq(&pieces[a].0, &pieces[b].0)) {
-                    let addressed: Vec<(usize, usize, usize)> = run
-                        .iter()
-                        .map(|&i| {
-                            let (_, lo, hi, at) = &pieces[i];
-                            (*lo, *hi, data + *at as usize)
-                        })
-                        .collect();
-                    // SAFETY: the mapping of the fetched bytes, `total` of
-                    // them; the copy into it has run, and the next waits
-                    // for this call.
-                    put.fetch_add(unsafe { pieces[run[0]].0.land_card(&addressed, after, &mut notes) }, Ordering::Relaxed);
-                }
-                notes.flush();
-                land::spent(land::stat::CARD_ALL, working);
-            });
-            land::count(land::stat::JOBS, jobs.len() as u64);
-            written = put.into_inner();
-        } else {
-            let mut title = Vec::new();
-            for (i, (shadow, lo, hi, at)) in pieces.iter().enumerate() {
-                if let Some(check) = &check {
-                    // SAFETY: as below.
-                    unsafe { check.look(i, data) };
-                }
-                if !keep(i) {
-                    continue;
-                }
-                // SAFETY: the mapping of the fetched bytes, `total` of them;
-                // the copy into it has run.
-                let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-                let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
-                shadow.walls_merged(gpu.len(), merged);
-                written += merged as u64;
-            }
-        }
+        // SAFETY: the mapping of the fetched bytes, `total` of them; the copy
+        // into it has run, and the next waits for this call.
+        let written = unsafe { land_pieces(&pieces, data, after, check.as_ref()) };
         land::spent(land::stat::CARD, merging);
         COPY_BACK[1].fetch_add(written, Ordering::Relaxed);
         if let Some(f) = fetch.as_mut() {
@@ -4908,6 +5059,9 @@ impl Host {
         }
         // Sends up to `after` are of no use to any later merge.
         crate::shadow::relay_fetched(after);
+        if let Some(ring) = ring {
+            ring.done();
+        }
     }
 
     /// [`relay`], on the thread that lands flights: `items` are the first
