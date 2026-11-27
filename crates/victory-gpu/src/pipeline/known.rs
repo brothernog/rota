@@ -237,6 +237,27 @@ pub fn use_translations(dir: PathBuf) {
     crate::shader_cache::use_shader_cache(dir);
 }
 
+/// From now on [`make`] goes through the runs' pipeline library kept in
+/// `dir`: a pipeline the library holds is loaded from it, one it lacks is
+/// made and stored. A run loads from that library and does not look at the
+/// driver's own cache for what it holds; with driver 621.40 the library
+/// keeps references into the driver's cache of this program, which only
+/// stores made through the library fill.
+pub fn use_library(dir: PathBuf) {
+    super::library::use_pipeline_cache(dir);
+}
+
+/// Writes the library [`use_library`] named if pipelines were stored.
+pub fn save_library() {
+    super::library::save(true);
+}
+
+/// Pipelines loaded from the library and made, since the start.
+pub fn library_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (super::library::LOADED.load(Relaxed), super::library::MADE.load(Relaxed))
+}
+
 /// Makes the host pipelines of those of `which` (numbers in the file) and
 /// lets each go again: the driver's cache on disk keeps them. `each` is told
 /// the number before, and what came of it after: milliseconds and whether

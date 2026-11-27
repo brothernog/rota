@@ -131,6 +131,9 @@ enum Command {
         /// (What the processes it starts are given.)
         #[arg(long, hide = true)]
         these: Option<String>,
+        /// (With --these: through the runs' pipeline library.)
+        #[arg(long, hide = true)]
+        store: bool,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -221,7 +224,7 @@ fn main() -> Result<()> {
         }
         Command::Shaders { paths, jobs } => translate::precompile(paths, jobs),
         #[cfg(windows)]
-        Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
+        Command::Warm { jobs, limit, again, used, these, store } => warm::run(jobs, limit, again, used, these, store),
         Command::Run {
             exe,
             unimplemented,
