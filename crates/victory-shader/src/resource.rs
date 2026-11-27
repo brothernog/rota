@@ -2384,6 +2384,18 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
         let (w, at) = (inline(*w)? & 31, inline(*at)? & 31);
         return Some(Moved::Const(((1u32 << w) - 1) << at));
     }
+    // The same with literals (the console compiler builds sampler words this way too);
+    // `VICTORY_WAVE_LDS_LOOSE=1` only (fork PR #799).
+    if inst.name() == "s_bfm_b32" && k == 0 && crate::emit::loose_lds::enabled() {
+        let constant = |o: &Operand| match *o {
+            Operand::Const(c) => inline(c),
+            Operand::Literal(x) => Some(x),
+            _ => None,
+        };
+        let width = constant(src.first()?)? & 31;
+        let offset = constant(src.get(1)?)? & 31;
+        return Some(Moved::Const(((1u32 << width) - 1) << offset));
+    }
     let src = src.first()?;
     match (inst.name(), *src) {
         ("s_mov_b32" | "s_mov_b64", Operand::Scalar { code, .. }) if code != NULL => {
@@ -2399,6 +2411,10 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
         // shortcut: a literal below 2^31, whose high dword is 0 whether the
         // hardware extends it with zeros or with its sign.
         ("s_mov_b64", Operand::Literal(x)) if x >> 31 == 0 => {
+            Some(Moved::Const(if k == 0 { x } else { 0 }))
+        }
+        // Any 32-bit literal, zero-extended (`VICTORY_WAVE_LDS_LOOSE=1` only; fork PR #799).
+        ("s_mov_b64", Operand::Literal(x)) if crate::emit::loose_lds::enabled() => {
             Some(Moved::Const(if k == 0 { x } else { 0 }))
         }
         // 64-bit inline integers are sign-extended.
