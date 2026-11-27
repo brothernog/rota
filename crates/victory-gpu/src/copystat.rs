@@ -990,7 +990,7 @@ fn micros(t: windows_sys::Win32::Foundation::FILETIME) -> u64 {
 }
 
 /// This thread's processor time so far (user, kernel), in microseconds.
-fn thread_times() -> (u64, u64) {
+pub(crate) fn thread_times() -> (u64, u64) {
     use windows_sys::Win32::Foundation::FILETIME;
     use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
     let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };

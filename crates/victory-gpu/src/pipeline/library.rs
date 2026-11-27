@@ -573,18 +573,43 @@ pub(crate) fn pipeline(
         }
         Err(e) => e,
     };
+    #[cfg(feature = "diagnostics")]
+    let load_ms = began.elapsed().as_secs_f64() * 1e3;
+    // This thread's processor time over the create: about the wall time when
+    // the driver compiles on it, far below it when the create waits.
+    #[cfg(feature = "diagnostics")]
+    let cpu = crate::copystat::thread_times();
     // Compiled outside any lock: compiles take up to seconds.
     let pso = {
         let _call = call("make", name);
         create()?
     };
+    #[cfg(feature = "diagnostics")]
+    let cpu_ms = {
+        let (user, kernel) = crate::copystat::thread_times();
+        (user + kernel).saturating_sub(cpu.0 + cpu.1) / 1000
+    };
     MADE.fetch_add(1, Ordering::Relaxed);
+    let ms = began.elapsed().as_secs_f64() * 1e3;
+    // `VICTORY_WARM_NAMES=<file>`: every name made, to set a warm's beside a
+    // run's (a run's name the warm never made: a description that differs).
+    #[cfg(feature = "diagnostics")]
+    if let Some(path) = std::env::var_os("VICTORY_WARM_NAMES") {
+        use std::io::Write;
+        let label = LABEL.with(|l| l.borrow().clone());
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "{name} {label}");
+        }
+    }
+    // A driver cache miss in the run: the warm made these in milliseconds.
+    #[cfg(feature = "diagnostics")]
+    if ms >= 300.0 {
+        let label = LABEL.with(|l| l.borrow().clone());
+        tracing::info!(ms = ms as u64, load_ms = load_ms as u64, create_cpu_ms = cpu_ms, name, label, refused = %refused, "host pipeline slow to make");
+    }
     crate::host::trail(|| {
         let label = LABEL.with(|l| l.borrow().clone());
-        format!(
-            "pipeline library: made {label} in {:.1} ms (the library did not load it: {refused})",
-            began.elapsed().as_secs_f64() * 1e3
-        )
+        format!("pipeline library: made {label} in {ms:.1} ms (the library did not load it: {refused})")
     });
     let _all = one_call();
     let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
