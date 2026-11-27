@@ -44,6 +44,16 @@ pub const COMPARE: &str = "victory: card compare";
 /// An upload buffer contents come back through.
 const STAGING: u64 = 256 << 20;
 
+fn replay_heap_flags(flags: i32) -> D3D12_HEAP_FLAGS {
+    // The replay uses resources immediately, without the host's residency queue.
+    const DROP: i32 = D3D12_HEAP_FLAG_SHARED.0
+        | D3D12_HEAP_FLAG_ALLOW_DISPLAY.0
+        | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER.0
+        | D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT.0
+        | D3D12_HEAP_FLAG_CREATE_NOT_ZEROED.0;
+    D3D12_HEAP_FLAGS(flags & !DROP)
+}
+
 /// Where buffers the CPU saw lie in a replay.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Buffers {
@@ -93,6 +103,9 @@ pub struct Options {
     pub only: Option<(u32, u32)>,
     /// The last command that runs (list, command); after it only barriers.
     pub until: Option<(u32, usize)>,
+    /// Run once, stopping after this many lists and commands of the next.
+    /// Use with [`replay`]. (0, 0) runs only setup. A prefix skips picture readback.
+    pub prefix: Option<(usize, usize)>,
     /// Skip what runs a pipeline whose name or shader hash has one of
     /// these in it.
     pub skip_shaders: Vec<String>,
@@ -133,6 +146,7 @@ impl Default for Options {
             awake: false,
             only: None,
             until: None,
+            prefix: None,
             skip_shaders: Vec::new(),
             shaders: None,
             shaders_b: None,
@@ -208,6 +222,13 @@ impl Report {
     /// The report as text.
     pub fn text(&self, what: &str) -> String {
         let mut t = String::new();
+        if self.frame_ms.is_empty() {
+            let _ = writeln!(t, "{what}: setup completed");
+            for n in &self.notes {
+                let _ = writeln!(t, "  note: {n}");
+            }
+            return t;
+        }
         let ms = |v: &[f64]| {
             v.iter()
                 .map(|x| format!("{x:.2}"))
@@ -453,7 +474,13 @@ pub fn listing(folder: &Path, lists: (u32, u32), line: &mut dyn FnMut(&str)) -> 
 /// Loads a capture and runs it: the whole of `victory replay`. The reports,
 /// with what each is of.
 pub fn replay(folder: &Path, options: &Options) -> Result<Vec<(String, Report)>> {
+    if options.prefix.is_some() && options.compare {
+        bail!("a prefix cannot be compared with a full frame");
+    }
     let mut player = Player::load(folder, options)?;
+    if let Some((lists, commands)) = options.prefix {
+        return Ok(vec![(format!("prefix {lists}:{commands}"), player.run_frame(options)?)]);
+    }
     let mut out = Vec::new();
     if options.compare && (options.edited() || options.shaders_b.is_some()) {
         // Turn by turn: what else the machine does falls on both.
@@ -572,6 +599,39 @@ impl Player {
         let folder = find(folder)?;
         let began = Instant::now();
         let frame = Frame::read(&folder.join("frame.bin"))?;
+        let commands: Vec<Vec<Cmd>> = frame
+            .lists
+            .iter()
+            .map(|l| Cmd::all(&l.commands.0))
+            .collect::<std::result::Result<_, _>>()?;
+        if let Some((lists, tail)) = options.prefix {
+            if options.skip_clamps {
+                bail!("a prefix cannot use --skip-clamps, which runs a full frame first");
+            }
+            let mut recorded = frame.submits.iter().flat_map(|s| &s.lists).filter(|&&l| l != MISSING);
+            if tail == 0 {
+                if lists > recorded.count() {
+                    bail!("prefix exceeds the recorded list count");
+                }
+            } else {
+                let cut = recorded
+                    .nth(lists)
+                    .and_then(|&l| commands.get(l as usize))
+                    .and_then(|list| list.get(..tail))
+                    .context("prefix exceeds the recorded list or command count")?;
+                let mut queries = HashSet::new();
+                for cmd in cut {
+                    match *cmd {
+                        Cmd::BeginQuery { heap, kind, index } => _ = queries.insert((heap, kind, index)),
+                        Cmd::EndQuery { heap, kind, index } => _ = queries.remove(&(heap, kind, index)),
+                        _ => {}
+                    }
+                }
+                if !queries.is_empty() {
+                    bail!("prefix ends inside an open GPU query");
+                }
+            }
+        }
         let (device, info) = make_device(&frame, options.debug, options.breadcrumbs)?;
         // SAFETY: plain creation and queries.
         let (queue, frequency) = unsafe {
@@ -583,11 +643,6 @@ impl Player {
             let frequency = queue.GetTimestampFrequency()? as f64;
             (queue, frequency)
         };
-        let commands: Vec<Vec<Cmd>> = frame
-            .lists
-            .iter()
-            .map(|l| Cmd::all(&l.commands.0))
-            .collect::<std::result::Result<_, _>>()?;
         let mut player = Player {
             folder,
             worker: Worker::new(&device, &queue)?,
@@ -631,15 +686,15 @@ impl Player {
             *at = Instant::now();
         };
         let mut at = Instant::now();
-        player.make_resources(options.buffers, &options.only_buffers)?;
+        player.make_resources(options.buffers, &options.only_buffers).context("creating frame resources")?;
         step("resources", &mut at);
-        player.make_pipelines(options.shaders.as_deref())?;
+        player.make_pipelines(options.shaders.as_deref()).context("creating frame pipelines")?;
         step("pipelines", &mut at);
-        player.make_descriptors()?;
+        player.make_descriptors().context("creating frame descriptor heaps")?;
         step("descriptors", &mut at);
-        player.load_contents()?;
+        player.load_contents().context("initializing frame contents")?;
         step("contents", &mut at);
-        player.make_masters(options.buffers, options.restore)?;
+        player.make_masters(options.buffers, options.restore).context("saving initial frame contents")?;
         step("copies to restore from", &mut at);
         let steps: Vec<String> = steps
             .iter()
@@ -747,8 +802,6 @@ impl Player {
                 _ => gpu::to_props(p),
             }
         };
-        // Flags a replay has no use for: sharing, display, not zeroed.
-        const DROP: i32 = 0x1 | 0x8 | 0x20 | 0x1000;
         let used_by_buffers_only: HashSet<u32> = {
             let mut textures = HashSet::new();
             for r in &self.frame.resources {
@@ -770,7 +823,7 @@ impl Player {
                 SizeInBytes: h.size,
                 Properties: props(&h.props, only.is_empty() && used_by_buffers_only.contains(&h.id)),
                 Alignment: h.alignment,
-                Flags: D3D12_HEAP_FLAGS(h.flags & !DROP),
+                Flags: replay_heap_flags(h.flags),
             };
             let mut heap: Option<ID3D12Heap> = None;
             // SAFETY: plain creation.
@@ -818,7 +871,7 @@ impl Player {
                         };
                         self.device.CreateCommittedResource(
                             &p,
-                            D3D12_HEAP_FLAGS(flags & !DROP),
+                            replay_heap_flags(*flags),
                             &desc,
                             state,
                             clear,
@@ -2033,11 +2086,21 @@ impl Player {
         let (mut skipped, mut hashed, mut uavs, mut merged) = (0, 0, 0, 0);
         let mut place = 0;
         let mut out = Vec::new();
-        for s in &self.frame.submits {
+        'submits: for s in &self.frame.submits {
             let mut lists = Vec::new();
             for &l in s.lists.iter().filter(|&&l| l != MISSING) {
-                let mut cmds = self.commands[l as usize].clone();
                 let here = place;
+                let len = match o.prefix {
+                    Some((full, tail)) if here as usize == full && tail > 0 => tail,
+                    Some((full, _)) if here as usize >= full => {
+                        if !lists.is_empty() {
+                            out.push(lists);
+                        }
+                        break 'submits;
+                    }
+                    _ => self.commands[l as usize].len(),
+                };
+                let mut cmds = self.commands[l as usize][..len].to_vec();
                 place += 1;
                 if o.only.is_some_and(|(from, to)| here < from || here > to) {
                     lists.push(edit::barriers_only(cmds));
@@ -3059,10 +3122,21 @@ impl Player {
 
     /// Runs the frame as the options say.
     pub fn run(&mut self, o: &Options) -> Result<Report> {
+        if o.prefix.is_some() {
+            bail!("use replay() for a prefix, which leaves resources in mid-frame states");
+        }
+        self.run_frame(o)
+    }
+
+    fn run_frame(&mut self, o: &Options) -> Result<Report> {
+        if o.prefix == Some((0, 0)) {
+            return Ok(Report { notes: self.notes.clone(), ..Default::default() });
+        }
         let mut made = self.prepare(o)?;
         let _awake = if o.awake { crate::host::awake::start(&self.device, || true) } else { None };
         let mut stamps = Vec::new();
-        for _ in 0..o.loops.max(1) {
+        let loops = if o.prefix.is_some() { 1 } else { o.loops.max(1) };
+        for _ in 0..loops {
             stamps.push(self.once(o, &mut made)?);
         }
         self.finish(o, made, &stamps)
@@ -3089,7 +3163,7 @@ impl Player {
         self.restore(o.restore)?;
         self.fresh = false;
         let stamps = self.send(built, o)?;
-        if let Some((db, _, hash, _)) = self.picture_now()? {
+        if o.prefix.is_none() && let Some((db, _, hash, _)) = self.picture_now()? {
             report.pictures.push((db, hash));
         }
         let ms = |a: u32, b: u32| {
@@ -3127,11 +3201,13 @@ impl Player {
         if o.detailed {
             self.detail(&built, stamps, o, &mut report);
         }
-        if self.merging {
+        if self.merging && o.prefix.is_none() {
             let notes = self.merge_notes(o.loops)?;
             report.notes.extend(notes);
         }
-        self.picture(o, &mut report)?;
+        if o.prefix.is_none() {
+            self.picture(o, &mut report)?;
+        }
         if let Some(q) = &self.info {
             report.notes.extend(debug_messages(q));
         }
@@ -3501,6 +3577,14 @@ fn debug_messages(q: &ID3D12InfoQueue) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_allocations_start_resident() {
+        let recorded = D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT.0 | D3D12_HEAP_FLAG_CREATE_NOT_ZEROED.0;
+        let placed = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
+        assert_eq!(replay_heap_flags(recorded), D3D12_HEAP_FLAG_NONE);
+        assert_eq!(replay_heap_flags(recorded | placed.0), placed);
+    }
 
     #[test]
     fn captures_are_found() {

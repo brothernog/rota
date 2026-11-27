@@ -95,6 +95,13 @@ pub(crate) struct Replay {
     /// of the others only barriers.
     #[arg(long)]
     only: Option<String>,
+    /// Run once and stop after LISTS complete lists and COMMANDS of the next
+    /// list. Use 0 to test setup alone.
+    #[arg(long, value_name = "LISTS[:COMMANDS]", value_parser = prefix,
+        conflicts_with_all = ["compare", "skip_clamps", "only", "until", "slots", "images",
+            "pixel", "check_written", "upcopies", "watch", "diverge", "diverge_picture",
+            "dump", "listing", "flow", "retranslate"])]
+    prefix: Option<(usize, usize)>,
     /// Leave out what runs a pipeline whose name or DXIL hash has this in it
     /// (may be given several times).
     #[arg(long = "skip-shader")]
@@ -233,6 +240,15 @@ fn pair(text: &str, by: char) -> Option<(u32, u32)> {
     Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
 }
 
+fn prefix(text: &str) -> Result<(usize, usize), &'static str> {
+    let (lists, commands) = text.split_once(':').unwrap_or((text, "0"));
+    lists
+        .parse()
+        .ok()
+        .zip(commands.parse().ok())
+        .ok_or("expected LISTS or LISTS:COMMANDS")
+}
+
 pub(crate) fn run(r: Replay) -> Result<()> {
     if let Some(text) = &r.dump {
         for line in play::dump(&r.folder, text)? {
@@ -291,6 +307,7 @@ pub(crate) fn run(r: Replay) -> Result<()> {
         awake: r.awake,
         only,
         until,
+        prefix: r.prefix,
         skip_shaders: r.skip_shader,
         shaders: r.shaders,
         shaders_b: r.shaders_b,

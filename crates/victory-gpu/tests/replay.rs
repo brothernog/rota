@@ -1707,6 +1707,20 @@ fn a_frame_is_recorded_and_replayed() {
         std::fs::read_to_string(folder.join("notes.txt")).unwrap()
     );
 
+    let prefix = Options {
+        prefix: Some((0, 2)),
+        detailed: true,
+        ..Default::default()
+    };
+    let prefix = play::replay(dir.path(), &prefix).unwrap().pop().unwrap().1;
+    assert_eq!(prefix.frame_ms.len(), 1);
+    assert_eq!(prefix.submits.len(), 1);
+    assert_eq!(prefix.submits[0].0, 1);
+    assert!(prefix.picture.is_none() && !folder.join("replay.png").exists());
+    let mut categories: Vec<_> = prefix.categories.iter().map(|c| (c.0.as_str(), c.2)).collect();
+    categories.sort_unstable();
+    assert_eq!(categories, [("barriers", 1), ("clears", 1)]);
+
     let plain = Options {
         loops: 3,
         ..Default::default()

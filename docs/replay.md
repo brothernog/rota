@@ -67,6 +67,7 @@ with the presented one.
 | `--listing 3..7` | only writes the frame's buffers and those lists' commands |
 | `--one-submit` | one `ExecuteCommandLists`, with a full wait between the former ones |
 | `--only 3..7` | runs these lists; of the others only barriers |
+| `--prefix 5` / `--prefix 5:12` | runs once, stopping after five lists or after the first twelve commands of the next list. `--prefix 0` checks setup alone. A prefix skips the picture readback |
 | `--no-merge` | copies of what the CPU wrote also overwrite the card's own results (below) |
 | `--skip-shader <text>` | leaves out what runs pipelines with the text in their name or DXIL hash (repeatable) |
 | `--shaders <folder>` | takes shaders from the folder where it has them: `<hash>.dxil`, by the hash the runtime names the title's shader by (a pass of ours: its own DXIL hash); with `--compare --shaders-b <folder>` a second set, turn by turn with the first |
