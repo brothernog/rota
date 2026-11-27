@@ -29,8 +29,11 @@ use super::*;
 
 /// Bytes of the index ahead of the slots: as the compare's results.
 pub(super) const INDEX: usize = 1 << 20;
-/// A slot: 64 KiB and the 16-byte widening of the hash at both ends.
-pub(super) const SLOT: usize = 65_600;
+/// A slot: 64 KiB and the 16-byte widening of the hash at both ends,
+/// rounded up to 256 bytes so every slot starts on whole cache lines (at
+/// 65,600 half the slots started mid-line: the card wrote PC memory in
+/// partial lines). The compare's source has it as a literal.
+pub(super) const SLOT: usize = 65_792;
 /// Of an index entry: the number did not fit.
 pub(super) const FULL: u32 = 0x8000_0000;
 const NUMBER: u32 = 0x7FFF_FFFF;
@@ -61,6 +64,13 @@ pub(super) fn lands() -> bool {
 pub(super) fn slots() -> u32 {
     let mb = std::env::var("VICTORY_CARD_RING_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(128);
     slots_for(mb)
+}
+
+/// `VICTORY_CARD_RING_WC=1`: the ring in write-combined PC memory (the
+/// compares with the ring took ~185 ms a frame on an RTX 3050 writing it
+/// write-back).
+fn write_combined() -> bool {
+    std::env::var_os("VICTORY_CARD_RING_WC").is_some_and(|v| v == "1")
 }
 
 /// Slots of 64 KiB in `mb` megabytes, rounded down to a power of two (the
@@ -218,7 +228,8 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         name(&pso, || "victory: card compare with the ring".into());
         let slots = slots();
-        let (buffer, data) = self.shared_buffer(bytes(slots)).ok_or_else(empty)?;
+        let page = if write_combined() { D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE } else { D3D12_CPU_PAGE_PROPERTY_WRITE_BACK };
+        let (buffer, data) = self.shared_buffer_paged(bytes(slots), page).ok_or_else(empty)?;
         name(&buffer, || "card ring".into());
         let counter = self.uav_buffer(64).ok_or_else(empty)?;
         name(&counter, || "card ring, next slot".into());
@@ -403,6 +414,15 @@ impl Look {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_compare_source_has_the_slot_layout() {
+        assert_eq!(SLOT % 256, 0, "slots start on whole lines");
+        assert!(SLOT >= (1 << 16) + 32);
+        let at = format!("{INDEX}u + (s & (slots - 1u)) * {SLOT}u");
+        assert!(CARD_COMPARE.contains(&at), "the shader's slot address is {at}");
+        assert!(INDEX as u64 + u64::from(MOST) * SLOT as u64 <= u64::from(u32::MAX));
+    }
 
     #[test]
     fn a_slot_number_wraps_into_the_ring() {

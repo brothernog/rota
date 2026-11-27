@@ -2185,7 +2185,7 @@ void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
                 s &= 0x7FFFFFFFu;
                 bool fits = ((s - tail) & 0x7FFFFFFFu) < slots;
                 ring.Store(out_at + id.x * 4u, fits ? s : (s | 0x80000000u));
-                if (fits) dest = 1048576u + (s & (slots - 1u)) * 65600u;
+                if (fits) dest = 1048576u + (s & (slots - 1u)) * 65792u;
             }
             hashes.Store4(piece * 16u, h);
         }
@@ -10221,11 +10221,18 @@ impl Host {
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.shared_buffer_paged(size, D3D12_CPU_PAGE_PROPERTY_WRITE_BACK)
+    }
+
+    /// [`Self::shared_buffer`] with the CPU pages given: write-combined ones
+    /// are not kept coherent with the CPU's caches, so the card writes them
+    /// without a snoop (and the CPU reads them slowly).
+    pub(crate) fn shared_buffer_paged(&self, size: u64, page: D3D12_CPU_PAGE_PROPERTY) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[2].fetch_add(1, Ordering::Relaxed);
         MADE[3].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_CUSTOM,
-            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+            CPUPageProperty: page,
             MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
             ..Default::default()
         };

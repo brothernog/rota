@@ -976,7 +976,7 @@ void main() {
     }
 
     const RING_INDEX: usize = 1 << 20;
-    const RING_SLOT: usize = 65_600;
+    const RING_SLOT: usize = 65_792; // host::ring::SLOT (private there)
     const CARD_PIECE: usize = 64 << 10;
 
     impl CardRig {
