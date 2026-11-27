@@ -9036,13 +9036,14 @@ impl Meter {
             }
         }
         {
-            let [own, asking, still, all] =
-                [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+            let [own, asking, still, all, scoped] =
+                [0, 1, 2, 3, 4].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
             if all >= 1.0 {
                 tracing::info!(
                     "texture refreshes per frame, all threads: {all:.1} ms, of them {own:.1} ms waiting for a texture another thread \
                      is refreshing, {asking:.1} ms asking the write watch and the guards, {still:.1} ms waiting for title memory to \
-                     hold still (the runtime remapping it); the rest is reading, hashing and detiling"
+                     hold still (the runtime remapping it), of which {scoped:.1} ms with the scoped lock \
+                     (VICTORY_TEXTURE_SCOPED_REMAP=1; 0 when off); the rest is reading, hashing and detiling"
                 );
             }
             let [through, left, filled, short] =
