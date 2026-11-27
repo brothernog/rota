@@ -2674,6 +2674,50 @@ unsafe fn land_pieces(pieces: &[torn::Landed], data: usize, after: u64, check: O
     written
 }
 
+/// `VICTORY_CARD_RING=4` ([`ring`]): what lands from the ring goes into
+/// title memory ahead of anything fetched, plan by plan in order: each its
+/// send (`CardPlan::sent_as`) and its parts (copy, from, to, where their
+/// bytes are from `data` on), with title bytes sent after its own send left
+/// out, since its slots hold what its flight ended with. Returns the bytes
+/// put into title memory.
+///
+/// # Safety
+/// `data` is the ring's mapping and holds every part's bytes, which stay as
+/// they are during the call.
+unsafe fn land_from_ring(plans: &mut [(u64, Vec<torn::Landed>)], data: usize) -> u64 {
+    use crate::land;
+    let merging = std::time::Instant::now();
+    let _merging = crate::timeline::span("landing: merging pieces from the card ring");
+    let mut written = 0;
+    for (sent_as, parts) in plans.iter_mut().filter(|p| !p.1.is_empty()) {
+        ring::STATS[8].fetch_add(parts.len() as u64, Ordering::Relaxed);
+        if land::on() {
+            *parts = ring_ordered(parts);
+        }
+        // SAFETY: the caller's.
+        written += unsafe { land_pieces(parts, data, *sent_as, None) };
+    }
+    land::spent(land::stat::CARD, merging);
+    ring::STATS[10].fetch_add(merging.elapsed().as_micros() as u64, Ordering::Relaxed);
+    written
+}
+
+/// Parts of one plan in [`crate::land::ordered`]'s order. Where that joins
+/// parts of a copy in one block of title memory, they are of one piece, so
+/// of one slot, and the slot's offsets follow theirs.
+fn ring_ordered(parts: &[torn::Landed]) -> Vec<torn::Landed> {
+    let keys: Vec<crate::land::Piece> =
+        parts.iter().map(|(shadow, lo, hi, _)| (shadow.id(), shadow.span().0 as usize + lo, hi - lo)).collect();
+    crate::land::ordered(&keys)
+        .into_iter()
+        .map(|(i, title, len)| {
+            let (shadow, lo, _, at) = &parts[i];
+            let from = title - shadow.span().0 as usize;
+            (shadow.clone(), from, from + len, at + (from - lo) as u64)
+        })
+        .collect()
+}
+
 /// For one plan of copies in the card's memory, with [`relay`]: `flags`
 /// holds, for every piece of every range of the plan, the copy, the
 /// piece's number in the copy and whether the compare flagged it there (or
@@ -3794,20 +3838,40 @@ fn late_line(frames: f64) {
             // (Did not fit, and not what the compare hashed: counts, not per frame, so that one shows.)
             let n: Vec<u64> = ring::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed)).collect();
             let t: Vec<f64> = n.iter().map(|&n| n as f64 / frames).collect();
-            tracing::info!(
-                "card ring per frame (VICTORY_CARD_RING=3, the shadow: landing still fetches): {:.1} pieces, {:.1} MB in the ring; \
-                 {} pieces did not fit and {} were not what the compare hashed (0 expected) since the last line; \
-                 {:.1} fetched parts looked for in the ring, {:.2} of them not as the ring has them (the fetch runs later, \
-                 a later flight's bytes may be in it); compares with the ring {:.2} ms on the card ({:.1} timed)",
-                t[0],
-                t[1] / (1 << 20) as f64,
-                n[2],
-                n[3],
-                t[4],
-                t[5],
-                t[6] / 1e6,
-                t[7],
-            );
+            if ring::lands() {
+                tracing::info!(
+                    "card ring per frame (VICTORY_CARD_RING=4, landing from the ring): {:.1} parts landed from it in {:.2} ms \
+                     (looking through it {:.2} ms), {:.1} parts left to the fetch; {} of {} landings fetched nothing; \
+                     {} pieces did not fit and {} were not what the compare hashed (0 expected; both fetched) since the last \
+                     line; {:.1} MB in the ring; compares with the ring {:.2} ms on the card ({:.1} timed)",
+                    t[8],
+                    t[10] / 1000.0,
+                    t[11] / 1000.0,
+                    t[9],
+                    n[12],
+                    n[13],
+                    n[2],
+                    n[3],
+                    t[1] / (1 << 20) as f64,
+                    t[6] / 1e6,
+                    t[7],
+                );
+            } else {
+                tracing::info!(
+                    "card ring per frame (VICTORY_CARD_RING=3, the shadow: landing still fetches): {:.1} pieces, {:.1} MB in the ring; \
+                     {} pieces did not fit and {} were not what the compare hashed (0 expected) since the last line; \
+                     {:.1} fetched parts looked for in the ring, {:.2} of them not as the ring has them (the fetch runs later, \
+                     a later flight's bytes may be in it); compares with the ring {:.2} ms on the card ({:.1} timed)",
+                    t[0],
+                    t[1] / (1 << 20) as f64,
+                    n[2],
+                    n[3],
+                    t[4],
+                    t[5],
+                    t[6] / 1e6,
+                    t[7],
+                );
+            }
         }
     }
     crate::land::log(frames);
@@ -4787,7 +4851,9 @@ impl Host {
     /// The relay's own list, fence, event for [`Host::relay_card_back`].
     fn make_relay_fetch(&self) -> Option<RelayFetch> {
         // SAFETY: plain object creation.
-        let copying = relay_copy().then(|| unsafe {
+        // Landing from the ring, the few pieces still fetched go over the
+        // drawing queue, in its order (no later flight caught at a piece).
+        let copying = (relay_copy() && !ring::lands()).then(|| unsafe {
             (|| -> windows::core::Result<(Prelude, ID3D12CommandQueue)> {
                 let allocator: ID3D12CommandAllocator = self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)?;
                 let list: ID3D12GraphicsCommandList =
@@ -4854,13 +4920,18 @@ impl Host {
         // have run, and their dwords are given to no other plan before these
         // are done with (`card_done`).
         let differs = differs.map(|(differs, dwords)| unsafe { std::slice::from_raw_parts(differs as *const u32, dwords) });
-        // `VICTORY_CARD_RING=3`: what the compares put in the ring, checked.
+        // `VICTORY_CARD_RING`: what the compares put in the ring, checked.
         let ring = differs.and_then(|differs| ring::look(plans, differs));
+        // `VICTORY_CARD_RING=4`: by plan, its send and the parts that land
+        // from the ring (`at` from its mapping on).
+        let lands = ring.as_ref().filter(|_| ring::lands());
+        let mut from_ring: Vec<(u64, Vec<torn::Landed>)> = plans.iter().map(|p| (p.0.sent_as, Vec::new())).collect();
         if let Some(differs) = differs {
             // Pieces caught while a later flight was at them (`torn`).
             let suspects = fetch.as_ref().map(|f| &f.suspects);
             let mut seen = std::collections::HashSet::new();
-            for &(plan, behind) in plans {
+            let mut seen_ring = std::collections::HashSet::new();
+            for (i, &(plan, behind)) in plans.iter().enumerate() {
                 plan.picked_found(differs);
                 let flags: Vec<(usize, u32, bool)> = plan
                     .ranges
@@ -4885,6 +4956,20 @@ impl Host {
                             continue;
                         }
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
+                        let piece = r.span.first + p;
+                        // (Not deduplicated across plans: each slot holds
+                        // what its own flight ended with.)
+                        if lo < hi
+                            && let Some(at) = lands.and_then(|l| l.part(i, (copy, piece), lo, hi, r.shadow.card_hashed(piece)))
+                        {
+                            if seen_ring.insert((i, copy, lo, hi)) {
+                                if upcheck::on() {
+                                    upcheck::fetched(r.shadow.id(), lo);
+                                }
+                                from_ring[i].1.push((r.shadow.clone(), lo, hi, at));
+                            }
+                            continue;
+                        }
                         if lo < hi && !seen.contains(&(copy, lo, hi)) {
                             let key = (r.shadow.id(), r.shadow.span().0 as usize + lo, hi - lo);
                             if fetch.as_ref().is_some_and(|f| f.had.holds(behind, key)) {
@@ -4923,6 +5008,15 @@ impl Host {
                 .collect();
         }
         land::spent(land::stat::GATHER, gathering);
+        if let Some(look) = lands {
+            // SAFETY: the ring's mapping; these plans' slots are not given
+            // to later compares before `done`, below.
+            let written = unsafe { land_from_ring(&mut from_ring, look.data) };
+            COPY_BACK[1].fetch_add(written, Ordering::Relaxed);
+            ring::STATS[9].fetch_add(pieces.len() as u64, Ordering::Relaxed);
+            ring::STATS[12].fetch_add(u64::from(pieces.is_empty()), Ordering::Relaxed);
+            ring::STATS[13].fetch_add(1, Ordering::Relaxed);
+        }
         if fetch.is_none() {
             *fetch = self.make_relay_fetch();
         }
@@ -4942,8 +5036,10 @@ impl Host {
         let behind = plans.iter().map(|p| p.0.sent_as).max().unwrap_or(0);
         if pieces.is_empty() {
             // Nothing to fetch: every send so far is older than the next
-            // fetch, if that goes to the queue the sends went to.
-            let after = match fetch.as_ref().is_some_and(|f| f.queue.is_some()) {
+            // fetch, if that goes to the queue the sends went to. Landing
+            // from the ring, a flight in the air lands what it ended with,
+            // and needs the sends after its own.
+            let after = match ring::lands() || fetch.as_ref().is_some_and(|f| f.queue.is_some()) {
                 true => behind,
                 false => *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()),
             };
@@ -5025,7 +5121,7 @@ impl Host {
             CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
             CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
         }
-        if let Some(ring) = &ring {
+        if let Some(ring) = ring.as_ref().filter(|_| !ring::lands()) {
             // SAFETY: the mapping of the fetched bytes, as `pieces` say; the
             // copy into it has run.
             unsafe { ring.against(&pieces, data) };
@@ -5046,8 +5142,9 @@ impl Host {
                 pieces.iter().map(|(shadow, lo, hi, _)| (shadow.id(), shadow.span().0 as usize + lo, hi - lo)),
             );
         }
-        // Sends up to `after` are of no use to any later merge.
-        crate::shadow::relay_fetched(after);
+        // Sends up to `after` are of no use to any later merge; landing from
+        // the ring, only those up to these flights' (as above).
+        crate::shadow::relay_fetched(if ring::lands() { behind } else { after });
         if let Some(ring) = ring {
             ring.done();
         }
@@ -10943,6 +11040,52 @@ mod refresh_tests {
             // A longer range was never taken whole.
             assert!(!copy.nothing_new(region, 6 * PAGE));
         }
+    }
+
+    /// `VICTORY_CARD_RING=4`: flight A ran behind send 1 and wrote both
+    /// pieces of a copy; then the title wrote the second piece and that went
+    /// up (send 2), ahead of flight B, which did not flag it. A's slots land
+    /// with A's send: what the title sent after it stays (with B's send, 2,
+    /// the slot's older byte would go over it).
+    #[test]
+    fn title_bytes_sent_after_a_flight_survive_its_ring_landing() {
+        let region = title(2 * PAGE, true);
+        let data = memory(2 * PAGE);
+        let copy = Shadow::unbacked(region as u64, data, (2 * PAGE) as u64, true);
+        copy.update(region, 2 * PAGE);
+        copy.send_up(1, 0);
+        // A's slots, one after the other: the pieces as A ended them.
+        let mut slots = vec![0u8; 2 * PAGE];
+        slots[100..116].fill(5);
+        slots[PAGE + 300..PAGE + 316].fill(6);
+        // SAFETY: the test's own memory.
+        unsafe { std::ptr::write_bytes((region + PAGE + 200) as *mut u8, 9, 4) };
+        copy.update(region, 2 * PAGE);
+        copy.send_up(2, 0);
+        let parts = vec![(copy.clone(), 0, PAGE, 0), (copy.clone(), PAGE, 2 * PAGE, PAGE as u64)];
+        let mut plans = vec![(1, parts), (2, Vec::new())];
+        // SAFETY: every part's bytes are in `slots`.
+        unsafe { super::land_from_ring(&mut plans, slots.as_ptr() as usize) };
+        // SAFETY: the test's own memory.
+        let byte = |at: usize| unsafe { ((region + at) as *const u8).read_volatile() };
+        assert_eq!(byte(100), 5, "what A wrote lands");
+        assert_eq!(byte(PAGE + 200), 9, "the title's bytes sent after A's send stay");
+    }
+
+    /// Parts of one piece that overlap are landed as one, read from where
+    /// the first lies in its slot; a part in another block stays as it is.
+    #[test]
+    fn joined_ring_parts_keep_their_slot_offsets() {
+        let start = 0x40_0000;
+        let copy = Shadow::unbacked(start, memory(2 * PAGE), (2 * PAGE) as u64, true);
+        let slot = 0x10_0000u64;
+        let parts = vec![
+            (copy.clone(), 150, 300, slot + 150),
+            (copy.clone(), PAGE + 8, PAGE + 64, 7 * slot + 8),
+            (copy.clone(), 100, 200, slot + 100),
+        ];
+        let ordered: Vec<(usize, usize, u64)> = super::ring_ordered(&parts).into_iter().map(|p| (p.1, p.2, p.3)).collect();
+        assert_eq!(ordered, [(100, 300, slot + 100), (PAGE + 8, PAGE + 64, 7 * slot + 8)]);
     }
 
     /// Of a copy in the card's memory only the dwords title memory changed go
