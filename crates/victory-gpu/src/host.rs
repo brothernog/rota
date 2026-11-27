@@ -2584,6 +2584,82 @@ fn landable(line: &[Option<u64>], completed: u64) -> usize {
     line.iter().position(|f| f.is_some_and(|f| f > completed)).unwrap_or(line.len())
 }
 
+/// What shaders wrote to copies in the card's memory goes into title memory
+/// ([`Host::relay_card_back`]): `pieces` are the parts landed (copy, from,
+/// to, where their bytes are from `data` on), and title bytes sent after
+/// send `after` are left out. With `check` (`torn`), each part's piece is
+/// looked at first. Returns the bytes put into title memory.
+///
+/// # Safety
+/// `data` is mapped and holds every part's bytes, which stay as they are
+/// during the call.
+unsafe fn land_pieces(pieces: &[torn::Landed], data: usize, after: u64, check: Option<&torn::Check>) -> u64 {
+    use crate::land;
+    // `VICTORY_TORN_HOLD`: the pieces flights still in the air may write.
+    let in_air = match check {
+        Some(_) if torn::hold() => torn::declared(&line().line),
+        _ => std::collections::HashSet::new(),
+    };
+    // Whether part `i` is merged now (after its piece was looked at).
+    let keep = |i: usize| {
+        let held = check.is_some_and(|c| torn::held(c.torn(i), c.piece(i), &in_air));
+        if held {
+            torn::HELD.fetch_add(1, Ordering::Relaxed);
+        }
+        !held
+    };
+    let mut written = 0;
+    if land::on() {
+        let titles: Vec<(usize, usize)> =
+            pieces.iter().map(|(shadow, lo, hi, _)| (shadow.span().0 as usize + lo, hi - lo)).collect();
+        let jobs = land::jobs(&titles);
+        let put = std::sync::atomic::AtomicU64::new(0);
+        land::each(jobs.len(), &|j| {
+            let working = std::time::Instant::now();
+            if let Some(check) = check {
+                for i in jobs[j].clone() {
+                    // SAFETY: as below.
+                    unsafe { check.look(i, data) };
+                }
+            }
+            let mut notes = land::Notes::default();
+            let parts: Vec<usize> = jobs[j].clone().filter(|&i| keep(i)).collect();
+            for run in parts.chunk_by(|&a, &b| std::sync::Arc::ptr_eq(&pieces[a].0, &pieces[b].0)) {
+                let addressed: Vec<(usize, usize, usize)> = run
+                    .iter()
+                    .map(|&i| {
+                        let (_, lo, hi, at) = &pieces[i];
+                        (*lo, *hi, data + *at as usize)
+                    })
+                    .collect();
+                // SAFETY: the caller's.
+                put.fetch_add(unsafe { pieces[run[0]].0.land_card(&addressed, after, &mut notes) }, Ordering::Relaxed);
+            }
+            notes.flush();
+            land::spent(land::stat::CARD_ALL, working);
+        });
+        land::count(land::stat::JOBS, jobs.len() as u64);
+        written = put.into_inner();
+    } else {
+        let mut title = Vec::new();
+        for (i, (shadow, lo, hi, at)) in pieces.iter().enumerate() {
+            if let Some(check) = check {
+                // SAFETY: as below.
+                unsafe { check.look(i, data) };
+            }
+            if !keep(i) {
+                continue;
+            }
+            // SAFETY: the caller's.
+            let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
+            let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
+            shadow.walls_merged(gpu.len(), merged);
+            written += merged as u64;
+        }
+    }
+    written
+}
+
 /// For one plan of copies in the card's memory, with [`relay`]: `flags`
 /// holds, for every piece of every range of the plan, the copy, the
 /// piece's number in the copy and whether the compare flagged it there (or
@@ -4878,71 +4954,9 @@ impl Host {
         }
         let merging = std::time::Instant::now();
         let _merging = crate::timeline::span("landing: merging fetched pieces");
-        // `VICTORY_TORN_HOLD`: the pieces flights still in the air may write.
-        let in_air = match &check {
-            Some(_) if torn::hold() => torn::declared(&line().line),
-            _ => std::collections::HashSet::new(),
-        };
-        // Whether part `i` is merged now (after its piece was looked at).
-        let keep = |i: usize| {
-            let held = check.as_ref().is_some_and(|c| torn::held(c.torn(i), c.piece(i), &in_air));
-            if held {
-                torn::HELD.fetch_add(1, Ordering::Relaxed);
-            }
-            !held
-        };
-        let mut written = 0;
-        if land::on() {
-            let titles: Vec<(usize, usize)> =
-                pieces.iter().map(|(shadow, lo, hi, _)| (shadow.span().0 as usize + lo, hi - lo)).collect();
-            let jobs = land::jobs(&titles);
-            let put = std::sync::atomic::AtomicU64::new(0);
-            land::each(jobs.len(), &|j| {
-                let working = std::time::Instant::now();
-                if let Some(check) = &check {
-                    for i in jobs[j].clone() {
-                        // SAFETY: as below.
-                        unsafe { check.look(i, data) };
-                    }
-                }
-                let mut notes = land::Notes::default();
-                let parts: Vec<usize> = jobs[j].clone().filter(|&i| keep(i)).collect();
-                for run in parts.chunk_by(|&a, &b| std::sync::Arc::ptr_eq(&pieces[a].0, &pieces[b].0)) {
-                    let addressed: Vec<(usize, usize, usize)> = run
-                        .iter()
-                        .map(|&i| {
-                            let (_, lo, hi, at) = &pieces[i];
-                            (*lo, *hi, data + *at as usize)
-                        })
-                        .collect();
-                    // SAFETY: the mapping of the fetched bytes, `total` of
-                    // them; the copy into it has run, and the next waits
-                    // for this call.
-                    put.fetch_add(unsafe { pieces[run[0]].0.land_card(&addressed, after, &mut notes) }, Ordering::Relaxed);
-                }
-                notes.flush();
-                land::spent(land::stat::CARD_ALL, working);
-            });
-            land::count(land::stat::JOBS, jobs.len() as u64);
-            written = put.into_inner();
-        } else {
-            let mut title = Vec::new();
-            for (i, (shadow, lo, hi, at)) in pieces.iter().enumerate() {
-                if let Some(check) = &check {
-                    // SAFETY: as below.
-                    unsafe { check.look(i, data) };
-                }
-                if !keep(i) {
-                    continue;
-                }
-                // SAFETY: the mapping of the fetched bytes, `total` of them;
-                // the copy into it has run.
-                let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-                let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
-                shadow.walls_merged(gpu.len(), merged);
-                written += merged as u64;
-            }
-        }
+        // SAFETY: the mapping of the fetched bytes, `total` of them; the copy
+        // into it has run, and the next waits for this call.
+        let written = unsafe { land_pieces(&pieces, data, after, check.as_ref()) };
         land::spent(land::stat::CARD, merging);
         COPY_BACK[1].fetch_add(written, Ordering::Relaxed);
         if let Some(f) = fetch.as_mut() {
