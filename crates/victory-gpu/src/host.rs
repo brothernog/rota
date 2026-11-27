@@ -10006,6 +10006,9 @@ impl Host {
             if let Some(Some((buffer, footprint))) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
+            // Composed frames count too, or the recorder never arms in the world.
+            #[cfg(feature = "diagnostics")]
+            crate::replay::record::present(&back, D3D12_RESOURCE_STATE_PRESENT);
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             p.meter.frame(p.hwnd);
         }
