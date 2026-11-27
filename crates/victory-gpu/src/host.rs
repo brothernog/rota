@@ -3734,6 +3734,7 @@ pub(crate) mod indirects;
 mod panel;
 mod place;
 pub(crate) mod rank;
+mod ring;
 mod send;
 pub(crate) use send::{goes_as_words, words_under};
 #[cfg(feature = "diagnostics")]
