@@ -1980,7 +1980,7 @@ const GUARD_FRAMES: u64 = 120;
 fn merge_guard() -> bool {
     // Diagnostics: on and off while the title runs (`crate::ab`); on only makes a range wait.
     #[cfg(feature = "diagnostics")]
-    if let Some(on) = crate::ab::pick("VICTORY_MERGE_GUARD") {
+    if let Some(on) = crate::picked!("VICTORY_MERGE_GUARD") {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -2104,7 +2104,7 @@ fn send_changed() -> bool {
     // Diagnostics: on and off while the title runs (`crate::ab`); each page decides for itself.
     #[cfg(feature = "diagnostics")]
     if crate::copystat::mode() == 0
-        && let Some(on) = crate::ab::pick("VICTORY_SEND_CHANGED")
+        && let Some(on) = crate::picked!("VICTORY_SEND_CHANGED")
     {
         return on;
     }

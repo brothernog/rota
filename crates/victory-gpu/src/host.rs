@@ -2259,7 +2259,7 @@ fn rehash_runs() -> bool {
     // Diagnostics: on and off while the title runs (`crate::ab`); a
     // submission decides once, and either way hashes the same pieces.
     #[cfg(feature = "diagnostics")]
-    if let Some(on) = crate::ab::pick("VICTORY_CARD_REHASH_RUNS") {
+    if let Some(on) = crate::picked!("VICTORY_CARD_REHASH_RUNS") {
         return on;
     }
     static ON: OnceLock<bool> = OnceLock::new();
@@ -3351,7 +3351,7 @@ fn joins_asked() -> (usize, usize) {
     let of = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<usize>().ok());
     let (parts, lists) = *MOST.get_or_init(|| (of("VICTORY_JOIN_PARTS").unwrap_or(1).max(1), of("VICTORY_JOIN_LISTS").unwrap_or(48).max(1)));
     #[cfg(feature = "diagnostics")]
-    if let Some(on) = crate::ab::pick("VICTORY_JOIN_PARTS") {
+    if let Some(on) = crate::picked!("VICTORY_JOIN_PARTS") {
         return (if on { 8 } else { 1 }, lists);
     }
     (parts, lists)
@@ -8193,7 +8193,7 @@ fn ahead_of_writes() -> bool {
 fn refresh_front() -> bool {
     // Diagnostics: on and off while the title runs (`crate::ab`); read once a submission.
     #[cfg(feature = "diagnostics")]
-    if let Some(on) = crate::ab::pick("VICTORY_REFRESH_FRONT") {
+    if let Some(on) = crate::picked!("VICTORY_REFRESH_FRONT") {
         return ahead_of_writes() && (joins_asked().0 > 1 || on);
     }
     static ON: OnceLock<bool> = OnceLock::new();

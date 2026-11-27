@@ -373,7 +373,7 @@ fn no_wait() -> bool {
     // Diagnostics: on and off while the title runs (`crate::ab`); each
     // refresh decides for itself.
     #[cfg(feature = "diagnostics")]
-    if let Some(on) = crate::ab::pick("VICTORY_TEXTURE_NO_WAIT") {
+    if let Some(on) = crate::picked!("VICTORY_TEXTURE_NO_WAIT") {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

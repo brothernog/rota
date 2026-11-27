@@ -58,7 +58,7 @@ pub(crate) fn goes_as_words(at: usize, len: usize) -> bool {
 pub(crate) fn words_under() -> bool {
     // Diagnostics: on and off while the title runs (`crate::ab`); read once per range merged.
     #[cfg(feature = "diagnostics")]
-    if let Some(on) = crate::ab::pick("VICTORY_UNDER_WORDS") {
+    if let Some(on) = crate::picked!("VICTORY_UNDER_WORDS") {
         return own() && on;
     }
     static ON: OnceLock<bool> = OnceLock::new();

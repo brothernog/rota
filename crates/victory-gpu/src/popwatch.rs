@@ -199,8 +199,8 @@ pub(crate) fn sent(taken: Taken, flown: u64, frame: u64) {
         flown,
         ms: crate::host::now_ms(),
         causes: crate::descriptor::host::pop_causes(),
-        phase: usize::from(crate::ab::pick("VICTORY_KEEP_SHOWN").unwrap_or(false))
-            + 2 * usize::from(crate::ab::pick("VICTORY_UPLOAD_AHEAD").unwrap_or(false)),
+        phase: usize::from(crate::picked!("VICTORY_KEEP_SHOWN").unwrap_or(false))
+            + 2 * usize::from(crate::picked!("VICTORY_UPLOAD_AHEAD").unwrap_or(false)),
     };
     let _ = to.send(job);
 }

@@ -37,6 +37,18 @@ macro_rules! toggled {
     }};
 }
 
+/// [`crate::ab::pick`] with the switch's number looked up once per call site
+/// (a search of the switches by name each call cost on hot paths).
+#[cfg(all(windows, feature = "diagnostics"))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! picked {
+    ($name:literal) => {{
+        static BIT: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+        BIT.get_or_init(|| $crate::ab::bit($name)).and_then($crate::ab::taken)
+    }};
+}
+
 #[cfg(test)]
 mod tests {
     use super::value_is_on;

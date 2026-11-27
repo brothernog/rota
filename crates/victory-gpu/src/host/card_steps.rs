@@ -96,7 +96,7 @@ pub(super) fn stage() -> u32 {
 /// 60 ms until the flights had landed (run n19).
 fn placed_order() -> bool {
     #[cfg(feature = "diagnostics")]
-    if let Some(on) = crate::ab::pick("VICTORY_PLACED_ORDER") {
+    if let Some(on) = crate::picked!("VICTORY_PLACED_ORDER") {
         return on;
     }
     static ON: OnceLock<bool> = OnceLock::new();

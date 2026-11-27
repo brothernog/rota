@@ -4381,7 +4381,7 @@ fn kin(old: &View, new: &View) -> Kin {
 /// same dimension.
 fn keep_shown() -> u8 {
     #[cfg(feature = "diagnostics")]
-    if let Some(on) = crate::ab::pick("VICTORY_KEEP_SHOWN") {
+    if let Some(on) = crate::picked!("VICTORY_KEEP_SHOWN") {
         return if on { 2 } else { 0 };
     }
     static KEEP: std::sync::OnceLock<u8> = std::sync::OnceLock::new();

@@ -39,7 +39,7 @@ const BATCH: (u64, usize) = (16 << 20, 64);
 /// Whether it is on (`VICTORY_UPLOAD_AHEAD`; off).
 pub(crate) fn on() -> bool {
     #[cfg(feature = "diagnostics")]
-    if let Some(on) = crate::ab::pick("VICTORY_UPLOAD_AHEAD") {
+    if let Some(on) = crate::picked!("VICTORY_UPLOAD_AHEAD") {
         return on;
     }
     static ON: OnceLock<bool> = OnceLock::new();

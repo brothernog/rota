@@ -638,7 +638,7 @@ thread_local! {
 pub(super) fn on() -> bool {
     // Diagnostics: on and off while the title runs (`crate::ab`).
     #[cfg(feature = "diagnostics")]
-    if let Some(on) = crate::ab::pick("VICTORY_ASYNC_SUBMIT") {
+    if let Some(on) = crate::picked!("VICTORY_ASYNC_SUBMIT") {
         return on && started();
     }
     static ON: OnceLock<bool> = OnceLock::new();

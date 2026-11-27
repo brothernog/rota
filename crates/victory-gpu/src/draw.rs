@@ -132,7 +132,7 @@ fn early_budgets() -> (u64, u64) {
 fn bake_exact() -> bool {
     // Diagnostics: on and off while the title runs (`crate::ab`); nothing it keeps outlives a pass.
     #[cfg(feature = "diagnostics")]
-    if let Some(on) = crate::ab::pick("VICTORY_BAKE_EXACT") {
+    if let Some(on) = crate::picked!("VICTORY_BAKE_EXACT") {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -545,7 +545,7 @@ fn heap_spread() -> bool {
 fn heap_pass_unmarked() -> bool {
     // Diagnostics: on and off while the title runs (`crate::ab`); a full look every 16 passes.
     #[cfg(feature = "diagnostics")]
-    if let Some(on) = crate::ab::pick("VICTORY_HEAP_PASS_UNMARKED") {
+    if let Some(on) = crate::picked!("VICTORY_HEAP_PASS_UNMARKED") {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
