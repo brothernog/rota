@@ -174,9 +174,10 @@ fn render(frame_h: usize) -> Option<(Bitmap, Vec<(i32, i32, u32)>)> {
         (text, if pending >> bit & 1 != 0 { YELLOW } else if on { GREEN } else { DIM })
     };
     let tag_w = g.measure(VALUE, "off*").0.max(g.measure(VALUE, "ON*").0) + gap;
+    let name_w = ab::MENU.iter().map(|(n, ..)| g.measure(ROW, short(n)).0).max().unwrap_or(0) + gap;
     let widths = ab::MENU
         .iter()
-        .map(|(n, _, what)| tag_w + g.measure(ROW, short(n)).0.max(g.measure(SMALL, what).0))
+        .map(|(_, _, what)| tag_w + name_w + g.measure(SMALL, what).0)
         .chain(lines.iter().map(|(l, v)| g.measure(ROW, l).0 + gap * 2 + g.measure(ROW, v).0))
         .chain(restart.iter().map(|t| g.measure(SMALL, t).0))
         .chain([g.measure(SMALL, foot).0, g.measure(VALUE, "Live switches").0 + gap * 2 + g.measure(SMALL, "F9").0]);
@@ -184,7 +185,7 @@ fn render(frame_h: usize) -> Option<(Bitmap, Vec<(i32, i32, u32)>)> {
     let h = pad
         + row_h
         + sep
-        + ab::MENU.len() as i32 * (row_h + small_h)
+        + ab::MENU.len() as i32 * row_h
         + sep
         + lines.len() as i32 * row_h
         + sep
@@ -214,9 +215,8 @@ fn render(frame_h: usize) -> Option<(Bitmap, Vec<(i32, i32, u32)>)> {
         let top = y;
         g.draw(&mut bm, VALUE, &text, pad, y, colour);
         g.draw(&mut bm, ROW, short(name), pad + tag_w, y, WHITE);
+        g.draw(&mut bm, SMALL, what, pad + tag_w + name_w, y + g.ascent[ROW] - g.ascent[SMALL], DIMMER);
         y += row_h;
-        g.draw(&mut bm, SMALL, what, pad + tag_w, y, DIMMER);
-        y += small_h;
         rows.push((top, y, bit));
     }
     y += sep / 2;
@@ -254,6 +254,7 @@ mod tests {
             assert_eq!(rows.len(), crate::ab::MENU.len());
             assert!(rows.windows(2).all(|r| r[0].1 <= r[1].0), "rows overlap at {frame_h}");
             assert!(rows.last().unwrap().1 < bm.h as i32, "last row outside the panel at {frame_h}");
+            assert!(bm.h + 16 * frame_h / 1080 <= frame_h, "panel taller than the picture at {frame_h}");
         }
     }
 

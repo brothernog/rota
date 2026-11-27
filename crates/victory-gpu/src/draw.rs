@@ -130,6 +130,11 @@ fn early_budgets() -> (u64, u64) {
 /// runs. So the pass ahead of a bake takes those slots too, and its uploads
 /// wait for title memory that is being remapped (`crate::texture` `BAKING`).
 fn bake_exact() -> bool {
+    // Diagnostics: on and off while the title runs (`crate::ab`); nothing it keeps outlives a pass.
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_BAKE_EXACT") {
+        return on;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_BAKE_EXACT").is_none_or(|v| v != "0"))
 }
@@ -538,6 +543,11 @@ fn heap_spread() -> bool {
 /// After realblastex/flamingo d56f7b0 (`mirror_unmarked`; there 14,089 to
 /// 9,111 slots looked at a frame, the pass 31.6 to 27.0 ms).
 fn heap_pass_unmarked() -> bool {
+    // Diagnostics: on and off while the title runs (`crate::ab`); a full look every 16 passes.
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_HEAP_PASS_UNMARKED") {
+        return on;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_PASS_UNMARKED").is_some_and(|v| v == "1"))
 }
