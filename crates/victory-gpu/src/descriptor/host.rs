@@ -4214,6 +4214,7 @@ fn make_twinned(
                     .cast::<D3D12_SAMPLER_DESC>()
                     .read_unaligned()
             };
+            let desc = crate::sampler::title(desc);
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
             Some(None)

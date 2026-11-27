@@ -121,9 +121,53 @@ pub(crate) fn console(words: &[u32; 27]) -> D3D12_SAMPLER_DESC {
     .host()
 }
 
+/// A sampler the title describes in the host's own layout (`CreateSampler`).
+/// Each filter / comparison pair is logged the first time it is seen.
+/// `VICTORY_SAMPLER_COMPARE=1`: a description with a real test (less ...
+/// greater-or-equal) but a plain filter gets the comparison filter of the
+/// same kind (a comparison sample through a plain sampler is undefined on
+/// the host; AMD hardware compares by instruction, other cards may not).
+pub(crate) fn title(mut desc: D3D12_SAMPLER_DESC) -> D3D12_SAMPLER_DESC {
+    static SEEN: std::sync::Mutex<Vec<(i32, i32)>> = std::sync::Mutex::new(Vec::new());
+    let pair = (desc.Filter.0, desc.ComparisonFunc.0);
+    if let Ok(mut seen) = SEEN.lock()
+        && !seen.contains(&pair)
+    {
+        seen.push(pair);
+        tracing::info!(filter = format_args!("{:#x}", pair.0), compare = pair.1, "title sampler");
+    }
+    if compare_fix() {
+        desc.Filter = with_compare(desc.Filter, desc.ComparisonFunc);
+    }
+    desc
+}
+
+/// `VICTORY_SAMPLER_COMPARE=1` ([`title`]).
+fn compare_fix() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SAMPLER_COMPARE").is_some_and(|v| v == "1"))
+}
+
+/// `filter` as a comparison filter when `compare` is a real test and the
+/// filter is a plain one (reduction bits 7..8 zero).
+fn with_compare(filter: D3D12_FILTER, compare: D3D12_COMPARISON_FUNC) -> D3D12_FILTER {
+    let real = (D3D12_COMPARISON_FUNC_LESS.0..=D3D12_COMPARISON_FUNC_GREATER_EQUAL.0).contains(&compare.0);
+    if real && filter.0 & 0x180 == 0 { D3D12_FILTER(filter.0 | 0x80) } else { filter }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_filter_with_a_test_becomes_a_comparison_filter() {
+        let f = |v| D3D12_FILTER(v);
+        assert_eq!(with_compare(f(0x15), D3D12_COMPARISON_FUNC_LESS_EQUAL).0, 0x95);
+        assert_eq!(with_compare(f(0x55), D3D12_COMPARISON_FUNC_GREATER).0, 0xd5);
+        assert_eq!(with_compare(f(0x15), D3D12_COMPARISON_FUNC_NEVER).0, 0x15);
+        assert_eq!(with_compare(f(0x95), D3D12_COMPARISON_FUNC_LESS).0, 0x95);
+        assert_eq!(with_compare(f(0x115), D3D12_COMPARISON_FUNC_LESS).0, 0x115, "min/max reduction kept");
+    }
 
     #[test]
     fn console_descriptions_decode() {
