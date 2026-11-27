@@ -623,9 +623,16 @@ pub(super) struct Taken {
     steps: std::collections::HashSet<(usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
     copied: Vec<(Arc<Shadow>, usize, usize)>,
     check: Option<Check>,
+    /// Whether the old wait is taken all the same ([`check`] `2`,
+    /// [`step_wait`]).
+    wait: bool,
 }
 
 impl Taken {
+    pub(super) fn waits(&self) -> bool {
+        self.wait
+    }
+
     pub(super) fn list(&self) -> &HostList {
         &self.own.list
     }
@@ -906,6 +913,13 @@ impl Host {
             steps: chosen.iter().map(|&(i, _)| steps[i]).collect(),
             copied,
             check,
+            wait: {
+                let small = ops.iter().any(|op| op.from.0.span().1 < SMALL);
+                let big = ops.iter().any(|op| op.from.0.span().1 >= SMALL);
+                let wait = self::check() == 2 || waits_for(step_wait(), in_frame(), small, big);
+                WAITED[usize::from(wait)].fetch_add(1, Ordering::Relaxed);
+                wait
+            },
         }))
     }
 
@@ -943,6 +957,71 @@ pub(super) fn check() -> u8 {
         _ => 0,
     })
 }
+
+/// Which submissions that take steps onto the card take the old wait all the
+/// same (`VICTORY_STEP_WAIT`; off by default), to find the ones whose wait
+/// keeps the picture right ([`check`] `2` waits at all of them: clean, and
+/// slow). Submissions are counted from the first one of a frame that takes
+/// steps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StepWait {
+    Off,
+    /// `a-b`: the `a`-th to the `b`-th of the frame (from 0), both in.
+    Range(u32, u32),
+    /// `small`: those with a step that reads a host copy under [`SMALL`].
+    Small,
+    /// `big`: those with a step that reads a host copy of [`SMALL`] or more.
+    Big,
+}
+
+/// A host copy under this many bytes is small for [`StepWait`] (the size
+/// under which copies are kept only in the PC's memory by default).
+const SMALL: u64 = 1 << 20;
+
+fn parse_wait(v: &str) -> StepWait {
+    match v.trim() {
+        "small" => StepWait::Small,
+        "big" => StepWait::Big,
+        v => v
+            .split_once('-')
+            .and_then(|(a, b)| Some(StepWait::Range(a.trim().parse().ok()?, b.trim().parse().ok()?)))
+            .or_else(|| v.parse().ok().map(|n| StepWait::Range(n, n)))
+            .unwrap_or(StepWait::Off),
+    }
+}
+
+fn step_wait() -> StepWait {
+    static WAIT: OnceLock<StepWait> = OnceLock::new();
+    *WAIT.get_or_init(|| std::env::var("VICTORY_STEP_WAIT").map_or(StepWait::Off, |v| parse_wait(&v)))
+}
+
+/// Whether the submission that is the `index`-th of its frame to take steps,
+/// with steps that read small and big host copies as said, waits.
+fn waits_for(wait: StepWait, index: u32, small: bool, big: bool) -> bool {
+    match wait {
+        StepWait::Off => false,
+        StepWait::Range(a, b) => (a..=b).contains(&index),
+        StepWait::Small => small,
+        StepWait::Big => big,
+    }
+}
+
+/// This submission's place among those of the frame that take steps (one
+/// submitting thread at a time: under the submission lock).
+fn in_frame() -> u32 {
+    static AT: Mutex<(u64, u32)> = Mutex::new((u64::MAX, 0));
+    let frame = crate::frame::current();
+    let mut at = AT.lock().unwrap_or_else(|e| e.into_inner());
+    if at.0 != frame {
+        *at = (frame, 0);
+    }
+    at.1 += 1;
+    at.1 - 1
+}
+
+/// Since the last frame-rate line: submissions that took steps without the
+/// old wait, and with it ([`StepWait`], [`check`] `2`).
+static WAITED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// A step looked at by [`check`]: title address, bytes, place in our buffer,
 /// whether a copy, the slot a fill shows, the host copy read (start, length).
@@ -1119,6 +1198,14 @@ pub(super) fn log(frames: f64) {
         d[2] / 1024.0,
         d[3],
     );
+    if check() == 2 || step_wait() != StepWait::Off {
+        let [free, waited] = [0, 1].map(|i| WAITED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        tracing::info!(
+            "submissions that took steps onto the card, per frame: {free:.1} without the old wait, {waited:.1} with it \
+             (VICTORY_STEP_WAIT={:?})",
+            step_wait(),
+        );
+    }
     if check() > 0 {
         log_check(frames);
     }
@@ -1356,6 +1443,22 @@ mod tests {
         assert_eq!(verdict(a, b, b), Verdict::Landed);
         assert_eq!(verdict(a, a, c), Verdict::Wrong);
         assert_eq!(verdict(a, b, c), Verdict::Unsure);
+    }
+
+    /// `VICTORY_STEP_WAIT`'s values, and which submissions they make wait.
+    #[test]
+    fn step_waits_pick_their_submissions() {
+        assert_eq!(parse_wait("3-7"), StepWait::Range(3, 7));
+        assert_eq!(parse_wait("5"), StepWait::Range(5, 5));
+        assert_eq!(parse_wait("small"), StepWait::Small);
+        assert_eq!(parse_wait("big"), StepWait::Big);
+        assert_eq!(parse_wait("x"), StepWait::Off);
+        let range = StepWait::Range(3, 7);
+        assert!(!waits_for(range, 2, true, true) && waits_for(range, 3, false, false) && waits_for(range, 7, false, false));
+        assert!(!waits_for(range, 8, true, true));
+        assert!(waits_for(StepWait::Small, 0, true, false) && !waits_for(StepWait::Small, 0, false, true));
+        assert!(waits_for(StepWait::Big, 0, false, true) && !waits_for(StepWait::Big, 0, true, false));
+        assert!(!waits_for(StepWait::Off, 0, true, true));
     }
 
     #[test]
