@@ -137,3 +137,211 @@ fn guest_cube_gradient_selects_mip_by_footprint() {
         assert_eq!(levels.as_slice(), expected, "{name}");
     }
 }
+
+// The compute-LOD probe below and its harness are from brothernog/rota#5 / #7
+// (LordLoon, ce908b9), GPL-3.0; the bias variant and the switch are ours.
+
+/// A compute program of `words` that reads a cube SRV, a raw output UAV and
+/// a sampler (the tables of the test above), in groups of `threads`.
+fn cube_program(words: Vec<u32>, threads: [u32; 3]) -> NativeProgram {
+    let table = |slot, user_data| RootParam {
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        sgprs: 1,
+        base_register: 0,
+        user_data,
+        slot,
+    };
+    let range = |kind, at, words, slot, user_data| UsedResource {
+        kind,
+        root: RootType::Table,
+        table_offset_dwords: at,
+        lower_bound: 0,
+        stride: 0,
+        dwords: words,
+        user_data,
+        slot,
+    };
+    NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 16,
+        layout: vec![table(0, 0), table(1, 2)],
+        used: vec![
+            range(ResourceType::Srv, 0, 8, 0, 0),
+            range(ResourceType::Uav, 8, 4, 0, 0),
+            range(ResourceType::Sampler, 0, 4, 1, 2),
+        ],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 3 << 1,
+            threads,
+        }),
+        code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
+    }
+}
+
+/// The descriptor loads of [`cube_program`]'s tables.
+const CUBE_PROLOGUE: [u32; 8] = [
+    0xBE81_0380,
+    0xBE83_0380, // s1, s3 = 0 (upper halves of the tables)
+    0xF40C_0400,
+    0xFA00_0000, // cube SRV to s[16:23] from s[0:1]
+    0xF408_0300,
+    0xFA00_0020, // raw output UAV to s[12:15] from s[0:1]+32
+    0xF408_0601,
+    0xFA00_0000, // sampler to s[24:27] from s[2:3]
+];
+
+/// Runs `native` on WARP and on the hardware device (where there is one)
+/// with `cube` and a raw UAV of `out` dwords; each device's UAV as floats.
+fn run_cube(native: &NativeProgram, cube: View, out: u32) -> Vec<(&'static str, Vec<f32>)> {
+    let (shader, _) = build_compute_shader(native).unwrap();
+    let sampler = D3D12_SAMPLER_DESC {
+        Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
+        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        MaxLOD: f32::MAX,
+        MaxAnisotropy: 1,
+        ..Default::default()
+    };
+    let mut results = Vec::new();
+    for (name, warp) in [("WARP", true), ("hardware", false)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {name} device; skipped");
+            continue;
+        };
+        // A program that takes the console's lane order asks for waves of 32.
+        let mut waves = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: waves is the correctly sized output for this feature query.
+        unsafe {
+            host.device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut waves).cast(),
+                    size_of_val(&waves) as u32,
+                )
+                .expect("wave capabilities");
+        }
+        if !(waves.WaveLaneCountMin..=waves.WaveLaneCountMax.max(waves.WaveLaneCountMin)).contains(&32) {
+            eprintln!("{name} has no waves of 32; skipped");
+            continue;
+        }
+        let (root, pso) = host.compute_pipeline(&shader).unwrap();
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(
+                        0,
+                        Root::Constants(vec![0; shader.user_data_dwords() as usize]),
+                    )],
+                    views: &[cube, View::RawUav(out)],
+                    samplers: &[sampler],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap();
+        results.push((name, out[0].iter().copied().map(f32::from_bits).collect()));
+    }
+    results
+}
+
+/// An implicit-LOD sample (`image_sample`, or `image_sample_b` with a bias of
+/// 1) in a compute program takes its derivatives from the quad lanes (lane
+/// xor 1 across x, xor 2 across y). Four lanes of a 64 x 64 cube, 8 texels apart
+/// (so 8 across x, 16 across y): level 4 (5 with the bias, which doubles
+/// them). Each device output: levels, then the lane coordinates.
+fn compute_lod_probe(biased: bool, flat: bool) -> Vec<(&'static str, Vec<f32>)> {
+    const SIZE: usize = 64;
+    const MIPS: u16 = 7;
+    let delta = 8.0f32 / SIZE as f32;
+    // The dimension field: CUBE, or 2D for the smoke test of `sampleGrad`.
+    let dim = if flat { 0x108 } else { 0x118 };
+    let mut words = CUBE_PROLOGUE.to_vec();
+    words.extend([
+        0x7E02_0D00, // v_cvt_f32_u32 v1, v0 (thread id x)
+        0x1002_02FF,
+        delta.to_bits(), // v_mul_f32 v1, delta, v1
+        0x0602_02FF,
+        1.5f32.to_bits(), // v_add_f32 v1, 1.5, v1
+        0x7E04_02FF,
+        1.5f32.to_bits(), // v2 = 1.5
+        0x7E06_0280,      // v3 = 0 (+X face)
+        0x341E_0082,      // v_lshlrev_b32 v15, 2, v0
+    ]);
+    if biased {
+        words.extend([
+            0x7E08_02FF,
+            1.0f32.to_bits(), // v4 = 1 (the bias)
+            0x7E0A_0301,      // v5 = v1
+            0x7E0C_0302,      // v6 = v2
+            0x7E0E_0280,      // v7 = 0
+            // image_sample_b, CUBE, dmask:R, address v[4:7], result v10.
+            0xF000_0000 | dim | (0x25 << 18),
+            0x00C4_0A04,
+        ]);
+    } else {
+        // image_sample, CUBE, dmask:R, address v[1:3], result v10.
+        words.extend([0xF000_0000 | dim | (0x20 << 18), 0x00C4_0A01]);
+    }
+    words.extend([
+        0xE070_1000,
+        0x8003_0A0F, // buffer_store_dword v10, v15 offen
+        0xE070_1010,
+        0x8003_010F, // buffer_store_dword v1, v15 offen offset:16
+        0xBF81_0000, // s_endpgm
+    ]);
+    let texels: Vec<_> = (0..6)
+        .flat_map(|_| {
+            (0..MIPS).flat_map(|mip| std::iter::repeat_n([f32::from(mip); 4], (SIZE >> mip).pow(2)))
+        })
+        .collect();
+    let native = cube_program(words, [4, 1, 1]);
+    let flat_texels = vec![[7.0f32; 4]; SIZE * SIZE];
+    let view = if flat {
+        View::Texture(SIZE as u32, SIZE as u32, &flat_texels)
+    } else {
+        View::Cube(SIZE as u32, MIPS, &texels)
+    };
+    run_cube(&native, view, 8)
+}
+
+/// With `VICTORY_COMPUTE_LOD=1` (forced here for this thread).
+#[test]
+fn cube_implicit_lod_in_compute_follows_the_quad() {
+    for biased in [false, true] {
+        let level = if biased { 5.0 } else { 4.0 };
+        for (name, got) in super::lower::compute_lod::force(|| compute_lod_probe(biased, false)) {
+            // The lanes have different coordinates: the probe itself is right.
+            assert_eq!(got[4..], [1.5, 1.625, 1.75, 1.875], "{name}: coordinates");
+            assert_eq!(got[..4], [level; 4], "{name}: levels (biased: {biased})");
+        }
+    }
+}
+
+/// Without the switch: the old shortcut, level 0 (a bias: that level).
+#[test]
+fn cube_implicit_lod_in_compute_is_level_zero_by_default() {
+    if std::env::var_os("VICTORY_COMPUTE_LOD").is_some() {
+        return;
+    }
+    for (name, got) in compute_lod_probe(false, false) {
+        assert_eq!(got[..4], [0.0; 4], "{name}");
+    }
+    for (name, got) in compute_lod_probe(true, false) {
+        assert_eq!(got[..4], [1.0; 4], "{name}");
+    }
+}
+
+/// A 2D sample takes the `sampleGrad` path (the texture has one level: this
+/// checks that the gradients are accepted and the sample reads its texel).
+#[test]
+fn flat_implicit_lod_in_compute_samples_with_gradients() {
+    for biased in [false, true] {
+        for (name, got) in super::lower::compute_lod::force(|| compute_lod_probe(biased, true)) {
+            assert_eq!(got[..4], [7.0; 4], "{name} (biased: {biased})");
+        }
+    }
+}

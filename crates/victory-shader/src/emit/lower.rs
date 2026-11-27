@@ -30,6 +30,11 @@ pub(super) mod intersect;
 #[path = "halves.rs"]
 mod halves;
 
+/// Quad-derived levels for implicit-LOD samples outside pixel shaders
+/// (`VICTORY_COMPUTE_LOD=1`), a child module so it shares the emitter's state.
+#[path = "compute_lod.rs"]
+pub(super) mod compute_lod;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -1559,6 +1564,9 @@ impl<'a> Lower<'a> {
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
+                    // (quad derivatives of implicit-LOD samples: `compute_lod`)
+                    || compute_lod::enabled()
+                        && matches!(n, "image_sample" | "image_sample_o" | "image_sample_cl" | "image_sample_b" | "image_sample_b_cl")
             }) || lane_constant_masks(x.st)
                 // (a branch the wave takes together asks the wave)
                 || !x.st.wide.is_empty();
@@ -11437,6 +11445,7 @@ impl<'a> Lower<'a> {
                 let x = addr_packed(self, coord_base, k)?;
                 *slot = to_float(self, x);
             }
+            let face_st = [cs[0], cs[1]];
             if kind == 5 {
                 let dir = self.cube_direction(cs[0], cs[1], cs[2]);
                 cs[..3].copy_from_slice(&dir);
@@ -11568,6 +11577,35 @@ impl<'a> Lower<'a> {
                 // level). The console takes derivatives from neighbouring
                 // lanes there; compute them from the lanes if a resolve
                 // shows the wrong mip.
+                60 | 61 if !self.s.pixel && compute_lod::enabled() => {
+                    // The quad's own derivatives (see `compute_lod`). A bias
+                    // scales the gradients by 2^bias: the same level shift.
+                    let bias = if op == 61 {
+                        let bias = addr_u32(self, usize::from(offset_word))?;
+                        Some(if *a16 {
+                            let low = self.s.m.i32(0xFFFF);
+                            let bias = self.s.m.bin(c, Bin::And, bias, low);
+                            to_float(self, bias)
+                        } else {
+                            self.as_float(bias)
+                        })
+                    } else {
+                        None
+                    };
+                    let fp = self.quad_footprint((kind, spatial), (&cs, face_st), bias, (h, has_cl, clamp));
+                    args.extend(&os);
+                    match fp {
+                        compute_lod::Footprint::Grad(g) => {
+                            args.extend(g);
+                            args.push(clamp);
+                            call_sample(self, "sampleGrad.f32", 63, &args, &mut gathered)
+                        }
+                        compute_lod::Footprint::Level(lod) => {
+                            args.push(lod);
+                            call_sample(self, "sampleLevel.f32", 62, &args, &mut gathered)
+                        }
+                    }
+                }
                 60 if !self.s.pixel => {
                     args.extend(&os);
                     args.push(self.s.m.f32(0));
@@ -11628,35 +11666,10 @@ impl<'a> Lower<'a> {
                     // longer of the two, in texels, and sampled directly.
                     // shortcut: no anisotropic filtering for these samples
                     // (the longer axis alone decides the level).
-                    let mut len = [fu; 2];
-                    for (axis, slot) in len.iter_mut().enumerate() {
-                        let mut sum = self.s.m.f32(0);
-                        for k in 0..2 {
-                            let x = addr_packed(self, first + axis * deriv_regs, k)?;
-                            let x = to_float(self, x);
-                            let sq = self.s.m.bin(c, Bin::Mul, x, x);
-                            sum = self.s.m.bin(c, Bin::Add, sum, sq);
-                        }
-                        *slot = self.unary(24, sum); // square root
-                    }
-                    let longer = self.binary(35, len[0], len[1]); // maximum
-                    let i32t = self.s.t.i32;
-                    let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
-                    let z = self.s.m.i32(0);
-                    let d = self
-                        .s
-                        .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, z]);
-                    let width = self.s.m.extract(c, d, 0);
-                    let width = self.s.m.cast(c, Cast::UiToFp, width, self.s.t.f32);
-                    let texels = self.s.m.bin(c, Bin::Mul, longer, width);
-                    // DXIL's logarithm is the one to base 2 (it was taken for
-                    // the natural one: every level came out 1.44 times too
-                    // high; DexNom/VIctory 921d8d3b). A length of 0 gives
-                    // minus infinity, which the sampler clamps to level 0.
-                    // SampleLevel takes no clamp: the instruction's least
-                    // level is applied here.
-                    let lod = self.unary(23, texels);
-                    let lod = if has_cl { self.binary(35, lod, clamp) } else { lod };
+                    let lod = self.cube_footprint_lod(h, has_cl, clamp, |l, axis, k| {
+                        let x = addr_packed(l, first + axis * deriv_regs, k)?;
+                        Ok(to_float(l, x))
+                    })?;
                     args.extend(&os);
                     args.push(lod);
                     call_sample(self, "sampleLevel.f32", 62, &args, &mut gathered)
