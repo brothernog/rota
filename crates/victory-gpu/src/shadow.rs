@@ -1978,6 +1978,11 @@ const GUARD_FRAMES: u64 = 120;
 /// picture went to bands and blots in runs STEP_CHECK=1 and LATE_WAIT=2 of
 /// 2026-11-26, while with the old wait (STEP_CHECK=2) it did not.
 fn merge_guard() -> bool {
+    // Diagnostics: on and off while the title runs (`crate::ab`); on only makes a range wait.
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_MERGE_GUARD") {
+        return on;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_MERGE_GUARD").is_some_and(|v| v == "1"))
 }
@@ -2096,6 +2101,13 @@ pub(crate) static ECHO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// Where a shader wrote in between, through a view nobody declared, the
 /// shader's stays.
 fn send_changed() -> bool {
+    // Diagnostics: on and off while the title runs (`crate::ab`); each page decides for itself.
+    #[cfg(feature = "diagnostics")]
+    if crate::copystat::mode() == 0
+        && let Some(on) = crate::ab::pick("VICTORY_SEND_CHANGED")
+    {
+        return on;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         #[cfg(feature = "diagnostics")]
@@ -3700,8 +3712,9 @@ impl Shadow {
             if self.card.is_some() {
                 // Whole words go up as pairs, all of them in one
                 // dispatch: only what is a copy of its own counts.
-                let runs = if crate::host::words_under() { word_runs(lo, title, held) } else { changed_runs(title, held) };
-                let own = |&&(r, m): &&(usize, usize)| !crate::host::words_under() || !crate::host::goes_as_words(at + r, m);
+                let words = crate::host::words_under();
+                let runs = if words { word_runs(lo, title, held) } else { changed_runs(title, held) };
+                let own = |&&(r, m): &&(usize, usize)| !words || !crate::host::goes_as_words(at + r, m);
                 let copies = runs.iter().filter(own).count() as i64;
                 if copies > 0 && left.fetch_sub(copies, Ordering::Relaxed) < copies {
                     return Err(());

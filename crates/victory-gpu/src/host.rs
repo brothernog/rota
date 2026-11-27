@@ -8191,6 +8191,11 @@ fn ahead_of_writes() -> bool {
 /// title memory, and behind such a step everything is asked for again, as it
 /// was.
 fn refresh_front() -> bool {
+    // Diagnostics: on and off while the title runs (`crate::ab`); read once a submission.
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_REFRESH_FRONT") {
+        return ahead_of_writes() && (joins_asked().0 > 1 || on);
+    }
     static ON: OnceLock<bool> = OnceLock::new();
     ahead_of_writes() && (joins_asked().0 > 1 || *ON.get_or_init(|| crate::switch::on("VICTORY_REFRESH_FRONT")))
 }

@@ -56,6 +56,11 @@ pub(crate) fn goes_as_words(at: usize, len: usize) -> bool {
 /// byte, that byte is as it was before the flight. The landing rests on the
 /// same ([`crate::shadow::exact_back`]).
 pub(crate) fn words_under() -> bool {
+    // Diagnostics: on and off while the title runs (`crate::ab`); read once per range merged.
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_UNDER_WORDS") {
+        return own() && on;
+    }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| own() && std::env::var_os("VICTORY_UNDER_WORDS").is_none_or(|v| v != "0"))
 }
