@@ -297,7 +297,13 @@ pub(crate) fn count(k: K, n: u64) {
     if !on() {
         return;
     }
-    BANK[mine().unwrap_or(SLOTS) % BANKS].0[k as usize].fetch_add(n, Relaxed);
+    BANK[mine_bank()].0[k as usize].fetch_add(n, Relaxed);
+}
+
+/// This thread's bank of counters.
+#[inline]
+fn mine_bank() -> usize {
+    mine().unwrap_or(SLOTS) % BANKS
 }
 
 fn total(i: usize) -> u64 {
@@ -457,6 +463,45 @@ pub fn title_memory_kind(at: usize, len: usize, write_combined: bool) {
     if write_combined {
         map.insert(at, at.saturating_add(len));
     }
+    WC_CHANGES.fetch_add(1, Relaxed);
+}
+
+/// Changes of [`WC`]: a stretch a thread keeps ([`SEGMENT`]) holds while
+/// this does.
+static WC_CHANGES: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// The last stretch this thread looked up: [`WC_CHANGES`] then, start,
+    /// end, and whether it is write-combined. Copies come in long runs
+    /// over one buffer, so most need no look at the map, whose lock all
+    /// copying threads share.
+    static SEGMENT: Cell<(u64, usize, usize, bool)> = const { Cell::new((u64::MAX, 0, 0, false)) };
+}
+
+/// The stretch of memory around `at` that is all write-combined or all
+/// not: a range of the map, or the gap between two.
+fn segment(map: &std::collections::BTreeMap<usize, usize>, at: usize) -> (usize, usize, bool) {
+    match map.range(..=at).next_back() {
+        Some((&s, &e)) if e > at => (s, e, true),
+        before => {
+            let from = before.map_or(0, |(_, &e)| e);
+            let to = map.range(at..).next().map_or(usize::MAX, |(&s, _)| s);
+            (from, to, false)
+        }
+    }
+}
+
+/// The bytes of `[at, end)` the title allocated write-combined.
+fn wc_of(at: usize, end: usize) -> usize {
+    let changes = WC_CHANGES.load(Relaxed);
+    let (seen, s, e, wc) = SEGMENT.get();
+    if seen == changes && s <= at && end <= e {
+        return if wc { end - at } else { 0 };
+    }
+    let map = WC.read().unwrap_or_else(|e| e.into_inner());
+    let (s, e, wc) = segment(&map, at);
+    SEGMENT.set((changes, s, e, wc));
+    if end <= e { if wc { end - at } else { 0 } } else { wc_bytes(&map, at, end) }
 }
 
 /// The title freed `[at, at + len)` (`len` 0: the allocation at `at`).
@@ -470,6 +515,7 @@ pub(crate) fn title_memory_gone(at: usize, len: usize) {
     } else {
         cut(&mut map, at, at.saturating_add(len));
     }
+    WC_CHANGES.fetch_add(1, Relaxed);
 }
 
 /// The bytes of `[at, end)` the title allocated write-combined.
@@ -494,23 +540,28 @@ pub(crate) fn copied(way: Copied, at: usize, len: usize, bytes: u64) {
     if !on() || len == 0 || bytes == 0 {
         return;
     }
-    let wc = wc_bytes(&WC.read().unwrap_or_else(|e| e.into_inner()), at, at.saturating_add(len)) as u64;
+    let wc = wc_of(at, at.saturating_add(len)) as u64;
     let wc = (bytes as u128 * wc as u128 / len as u128) as u64;
     let (w, o) = match way {
         Copied::Up => (K::UpWcBytes, K::UpOtherBytes),
         Copied::BackCompared => (K::BackComparedWcBytes, K::BackComparedOtherBytes),
         Copied::Back => (K::BackWcBytes, K::BackOtherBytes),
     };
-    count(w, wc);
-    count(o, bytes - wc);
+    if wc > 0 {
+        count(w, wc);
+    }
+    if bytes > wc {
+        count(o, bytes - wc);
+    }
 }
 
 /// List calls by where in `list.rs` they come from (a line; 0: free),
 /// with their calls and nanoseconds. Lines are few (one per method).
 const SITES: usize = 128;
 static SITE_LINE: [AtomicU32; SITES] = [const { AtomicU32::new(0) }; SITES];
-static SITE_CALLS: [AtomicU64; SITES] = [const { AtomicU64::new(0) }; SITES];
-static SITE_NS: [AtomicU64; SITES] = [const { AtomicU64::new(0) }; SITES];
+/// Per bank, as [`count`]'s: the recording threads add to lines of their own.
+static SITE_CALLS: [[AtomicU64; SITES]; BANKS] = [const { [const { AtomicU64::new(0) }; SITES] }; BANKS];
+static SITE_NS: [[AtomicU64; SITES]; BANKS] = [const { [const { AtomicU64::new(0) }; SITES] }; BANKS];
 
 /// A list call from `line` of `list.rs` took `ns`, `lock_ns` of them
 /// waiting for the list's state.
@@ -529,8 +580,9 @@ pub(crate) fn list_call(line: u32, ns: u64, lock_ns: u64) {
                     Err(now) => now == line,
                 });
         if mine {
-            SITE_CALLS[i].fetch_add(1, Relaxed);
-            SITE_NS[i].fetch_add(ns, Relaxed);
+            let bank = mine_bank();
+            SITE_CALLS[bank][i].fetch_add(1, Relaxed);
+            SITE_NS[bank][i].fetch_add(ns, Relaxed);
             return;
         }
         i = (i + 1) % SITES;
@@ -1057,7 +1109,7 @@ impl Looker {
         let mut sites: Vec<(u64, u64, u32)> = (0..SITES)
             .filter_map(|i| {
                 let line = SITE_LINE[i].load(Relaxed);
-                let now = (SITE_CALLS[i].load(Relaxed), SITE_NS[i].load(Relaxed));
+                let now = (0..BANKS).fold((0, 0), |(c, n), b| (c + SITE_CALLS[b][i].load(Relaxed), n + SITE_NS[b][i].load(Relaxed)));
                 let was = std::mem::replace(&mut self.sites[i], now);
                 (line != 0 && now.1 > was.1).then(|| (now.1 - was.1, now.0 - was.0.min(now.0), line))
             })
@@ -1286,6 +1338,10 @@ mod tests {
         map.insert(100, 200);
         map.insert(300, 400);
         assert_eq!(wc_bytes(&map, 150, 350), 50 + 50);
+        assert_eq!(segment(&map, 150), (100, 200, true));
+        assert_eq!(segment(&map, 250), (200, 300, false));
+        assert_eq!(segment(&map, 50), (0, 100, false));
+        assert_eq!(segment(&map, 400), (400, usize::MAX, false));
         cut(&mut map, 120, 330);
         assert_eq!(map.into_iter().collect::<Vec<_>>(), vec![(100, 120), (330, 400)]);
     }
