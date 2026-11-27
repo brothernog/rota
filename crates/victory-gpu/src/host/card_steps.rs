@@ -148,16 +148,14 @@ pub(super) fn writers(items: &[Late]) -> Vec<Writer> {
                         copy: false,
                     }));
                 }
-                for &i in &flight.order {
-                    for &(_, at, [row, rows, pitch]) in &flight.lists[i].host().deferred().backs {
-                        out.push(Writer {
-                            shadow: None,
-                            from: at,
-                            to: at + rows.saturating_sub(1) * pitch + row,
-                            copy: false,
-                        });
-                    }
-                }
+                // Every read-back's destination, explicit and shader texture
+                // alike (TaynanGT/Vice-Tay 7ae1afc, gomeaw, GPL-3.0).
+                out.extend(flight.texture_back_ranges.iter().map(|&(from, to)| Writer {
+                    shadow: None,
+                    from,
+                    to,
+                    copy: false,
+                }));
                 out.extend(flight.own.iter().flat_map(Taken::copied));
             }
             Late::Write(at, _, bytes) => out.push(Writer {

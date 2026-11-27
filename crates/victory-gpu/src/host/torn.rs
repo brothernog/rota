@@ -35,6 +35,40 @@ pub(super) fn on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_FETCH_CHECK").is_some_and(|v| v == "1"))
 }
 
+/// `VICTORY_TORN_HOLD=1`, with the check: a part of a piece found torn is
+/// not merged while a flight still in the air may write that piece. Title
+/// memory keeps the whole value before it (late, not half made), the range
+/// stays closed for that flight, and its landing fetches the piece (it is
+/// suspect). With no such flight it is merged as before: kept back, the
+/// CPU's side would differ from the card's once the range opens, and a
+/// refresh of its page would send the old bytes up.
+pub(super) fn hold() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| on() && std::env::var_os("VICTORY_TORN_HOLD").is_some_and(|v| v == "1"))
+}
+
+/// Parts held back by [`hold`] since the last frame-rate line.
+pub(super) static HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The pieces the flights in `line` (those not being landed) may write.
+pub(super) fn declared(line: &[Late]) -> HashSet<Piece> {
+    let mut pieces = HashSet::new();
+    for item in line {
+        let Late::Run(flight) = item else { continue };
+        let Some(plan) = &flight.card else { continue };
+        for r in plan.ranges.iter().filter(|r| !r.picked) {
+            pieces.extend((0..r.span.pieces).map(|p| (r.shadow.id(), r.span.first + p)));
+        }
+    }
+    pieces
+}
+
+/// Whether a part is held back: its piece was found torn and a flight in
+/// the air may write it.
+pub(super) fn held(torn: bool, piece: Piece, ahead: &HashSet<Piece>) -> bool {
+    torn && ahead.contains(&piece)
+}
+
 /// A piece: its copy's number, and the piece.
 pub(super) type Piece = (u64, u32);
 
@@ -140,6 +174,17 @@ impl Check {
         // SAFETY: the caller's.
         let bytes = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, to - from) };
         self.found[i].store(if self::hash(bytes) == hash { 1 } else { 2 }, Ordering::Relaxed);
+    }
+
+    /// Whether part `i` of what is landed is of a piece found torn (after
+    /// [`Check::look`] of it).
+    pub(super) fn torn(&self, i: usize) -> bool {
+        self.found[self.within[i]].load(Ordering::Relaxed) == 2
+    }
+
+    /// The piece part `i` of what is landed is of.
+    pub(super) fn piece(&self, i: usize) -> Piece {
+        self.of[self.within[i]].0
     }
 
     /// All is landed: what was found is kept for later flights.
