@@ -34,7 +34,7 @@ macro_rules! wrapped {
                     // (or the module the title imports it from).
                     let real: unsafe extern "system" fn($($type),*) $(-> $result)? =
                         unsafe { std::mem::transmute(TABLE[$index].1.load(Ordering::Relaxed)) };
-                    if !on() {
+                    if !on() && !(crate::framelog::on() && counted_wait($index)) {
                         // SAFETY: the caller's own call.
                         return unsafe { real($($arg),*) };
                     }
@@ -45,12 +45,22 @@ macro_rules! wrapped {
     };
 }
 
+/// The wrappers of the title's waits the frame log counts
+/// (`VICTORY_FRAME_LOG`) while no timeline is recorded: the waits, and the
+/// locks after a try that failed ([`lock_of`]).
+const fn counted_wait(index: usize) -> bool {
+    matches!(index, 0 | 1 | 2 | 3 | 7 | 9 | 11 | 13 | 16 | 17 | 20 | 27)
+}
+
 /// Runs `call`, a wait on `object` that may be long; what the caller may
 /// ask [`GetLastError`] about stays.
 ///
 /// [`GetLastError`]: windows_sys::Win32::Foundation::GetLastError
 fn wait<T>(name: &'static str, object: u64, call: impl FnOnce() -> T) -> T {
     use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+    if !on() {
+        return crate::framelog::title_wait(object, call);
+    }
     let t0 = ticks();
     let result = {
         let _standing = standing(object);
@@ -79,14 +89,9 @@ fn measured<T>(name: &'static str, bytes: usize, call: impl FnOnce() -> T) -> T 
     result
 }
 
-/// The function `name` of the table, as the system has it.
-fn real(name: &str) -> usize {
-    TABLE.iter().find(|t| t.0 == name).map_or(0, |t| t.1.load(Ordering::Relaxed))
-}
-
 /// `take(lock)`, a try that does not wait, then `wait`.
-fn lock_of(name: &'static str, lock: Handle, take: &str, call: impl FnOnce()) {
-    let take = real(take);
+fn lock_of(name: &'static str, lock: Handle, take: usize, call: impl FnOnce()) {
+    let take = TABLE[take].1.load(Ordering::Relaxed);
     if take != 0 {
         // SAFETY: `TryEnterCriticalSection` or a `TryAcquireSRWLock` call:
         // one pointer, a truth value (one byte of it for the latter).
@@ -131,21 +136,21 @@ wrapped! {
         unsafe { real(object) }
     };
     7 EnterCriticalSection(lock: Handle) => |real: unsafe extern "system" fn(Handle)| {
-        lock_of("EnterCriticalSection", lock, "TryEnterCriticalSection", || unsafe { real(lock) })
+        lock_of("EnterCriticalSection", lock, 29, || unsafe { real(lock) })
     };
     8 LeaveCriticalSection(lock: Handle) => |real: unsafe extern "system" fn(Handle)| {
         released("LeaveCriticalSection", lock);
         unsafe { real(lock) }
     };
     9 AcquireSRWLockExclusive(lock: Handle) => |real: unsafe extern "system" fn(Handle)| {
-        lock_of("AcquireSRWLockExclusive", lock, "TryAcquireSRWLockExclusive", || unsafe { real(lock) })
+        lock_of("AcquireSRWLockExclusive", lock, 30, || unsafe { real(lock) })
     };
     10 ReleaseSRWLockExclusive(lock: Handle) => |real: unsafe extern "system" fn(Handle)| {
         released("ReleaseSRWLockExclusive", lock);
         unsafe { real(lock) }
     };
     11 AcquireSRWLockShared(lock: Handle) => |real: unsafe extern "system" fn(Handle)| {
-        lock_of("AcquireSRWLockShared", lock, "TryAcquireSRWLockShared", || unsafe { real(lock) })
+        lock_of("AcquireSRWLockShared", lock, 31, || unsafe { real(lock) })
     };
     12 ReleaseSRWLockShared(lock: Handle) => |real: unsafe extern "system" fn(Handle)| {
         released("ReleaseSRWLockShared", lock);
@@ -217,13 +222,20 @@ const ONLY_REAL: usize = 29;
 
 /// Asks the system for the real functions, and points our own import table
 /// at the wrappers: once, if a timeline is wanted.
+/// With only the frame log on (`VICTORY_FRAME_LOG`) the title's imports are
+/// bound and our own import table is left as it is: its locks are ours.
 fn arm() -> bool {
     static ONCE: Once = Once::new();
-    if !super::record::wanted() {
-        return false;
+    static REAL: Once = Once::new();
+    if super::record::wanted() {
+        ONCE.call_once(wrap_own);
+        return true;
     }
-    ONCE.call_once(wrap_own);
-    true
+    if crate::framelog::on() {
+        REAL.call_once(find_real);
+        return true;
+    }
+    false
 }
 
 /// See [`arm`].

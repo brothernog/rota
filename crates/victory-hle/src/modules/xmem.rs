@@ -1213,6 +1213,7 @@ pub extern "system" fn XMemMapPhysicalPages(
     n: usize,
     pages: *const usize,
 ) -> *mut c_void {
+    let _framelog = victory_gpu::framelog::xmem(victory_gpu::framelog::Xmem::Title, n as u64);
     let base = address as usize;
     // Read before any lock is taken: a fault in title memory may wait for
     // the mapping call that holds them.
@@ -1279,6 +1280,7 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     if addresses.is_null() {
         return 0;
     }
+    let _framelog = victory_gpu::framelog::xmem(victory_gpu::framelog::Xmem::Title, n as u64);
     lift_thread();
     if side_by_side() > 1 && n > 1 {
         // Read before any lock is taken, as in `XMemMapPhysicalPages`.

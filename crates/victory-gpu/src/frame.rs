@@ -149,6 +149,8 @@ pub(crate) extern "system" fn wait(
         wait = Duration::ZERO;
     }
     let _called = crate::timeline::span("the title's frame wait");
+    #[cfg(all(windows, feature = "diagnostics"))]
+    let framelog = crate::framelog::enter(crate::framelog::State::Pace);
     let hr = if wait > limit {
         std::thread::sleep(limit);
         TIMEOUT
@@ -157,6 +159,8 @@ pub(crate) extern "system" fn wait(
         last(kind).fetch_max(tick, Ordering::Relaxed);
         S_OK
     };
+    #[cfg(all(windows, feature = "diagnostics"))]
+    drop(framelog);
     #[cfg(all(windows, feature = "diagnostics"))]
     {
         use crate::copystat::{C, add};

@@ -186,6 +186,8 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     // A still-pending pipeline was requested by the title too. Prewarm it
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
+        #[cfg(feature = "diagnostics")]
+        crate::framelog::count(crate::framelog::K::PipelinesAsked, 1);
         super::library::note_used(&p.key);
     }
     if p.made.get().is_none() {
@@ -270,6 +272,8 @@ fn wait(p: &Pending, frame: u64) {
         return;
     }
     let started = Instant::now();
+    #[cfg(feature = "diagnostics")]
+    let _framelog = crate::framelog::waiting_pipeline();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() {

@@ -30,6 +30,7 @@ pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
 mod draw;
+pub mod framelog;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;

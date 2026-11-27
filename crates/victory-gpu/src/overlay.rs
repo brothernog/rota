@@ -213,6 +213,15 @@ fn cpu_name() -> String {
 
 const GB: f64 = 1024.0 * 1024.0 * 1024.0;
 
+/// When the overlay began: the clock of the CSV's `t_s` column.
+static RUN_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// [`RUN_START`], once the overlay has begun (the frame log's `t_s`).
+#[cfg_attr(not(all(windows, feature = "diagnostics")), allow(dead_code))]
+pub(crate) fn run_start() -> Option<std::time::Instant> {
+    RUN_START.get().copied()
+}
+
 fn sample(cpu: &mut Cpu, gpu: Option<&Gpu3d>, adapter: Option<&IDXGIAdapter3>, names: &(String, String)) -> Stats {
     // SAFETY: plain structs filled by the calls.
     let ram = unsafe {
@@ -605,7 +614,7 @@ fn run(game: HWND, adapter: Option<IDXGIAdapter3>) {
         .unwrap_or_else(|| "GPU".into());
     let names = (cpu_name(), gpu_name);
     let mut csv = open_csv();
-    let started = std::time::Instant::now();
+    let started = *RUN_START.get_or_init(std::time::Instant::now);
     let mut written = 0u64;
     let class = wide("VictoryOverlay");
     // SAFETY: window class and window made and used on this thread only.

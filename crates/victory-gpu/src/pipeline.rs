@@ -750,6 +750,7 @@ pub(crate) fn note_drop(this: This) {
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn note_why(why: String) {
     crate::capture::op(0, || format!("DROPPED {why}"));
+    crate::framelog::count(crate::framelog::K::Dropped, 1);
     let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
     *drops.get_or_insert_with(HashMap::new).entry(why).or_default() += 1;
 }
@@ -986,6 +987,13 @@ pub mod known;
 mod library;
 #[cfg(windows)]
 mod make;
+
+/// Host pipelines made and loaded from the library so far (the frame log).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn made_loaded() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (library::MADE.load(Relaxed), library::LOADED.load(Relaxed))
+}
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.

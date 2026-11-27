@@ -1000,6 +1000,13 @@ pub(crate) fn thread_times() -> (u64, u64) {
     (micros(user), micros(kernel))
 }
 
+/// The process's processor time so far, user and kernel together, in
+/// microseconds.
+pub(crate) fn process_cpu_us() -> u64 {
+    let (user, kernel) = process_times();
+    user + kernel
+}
+
 /// The process's processor time so far (user, kernel), in microseconds.
 fn process_times() -> (u64, u64) {
     use windows_sys::Win32::Foundation::FILETIME;
@@ -1029,6 +1036,8 @@ pub(crate) fn recorded(started: std::time::Instant) {
     crate::timeline::called(took);
     add(C::RecordCalls, 1);
     add(C::RecordNs, ns);
+    crate::framelog::count(crate::framelog::K::ListCalls, 1);
+    crate::framelog::count(crate::framelog::K::ListNs, ns);
     if !RECORDED_SINCE.load(Relaxed) && !RECORDED_SINCE.swap(true, Relaxed) {
         let began = now_us().saturating_sub(ns / 1000);
         add(C::UntilRecordUs, began.saturating_sub(PRESENTED_AT.load(Relaxed)));
@@ -1118,7 +1127,7 @@ pub(crate) fn presented() {
     SUBMITTED_SINCE.store(false, Relaxed);
 }
 
-fn page_faults() -> u64 {
+pub(crate) fn page_faults() -> u64 {
     use windows_sys::Win32::System::ProcessStatus::{
         K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
     };

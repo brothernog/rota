@@ -779,6 +779,19 @@ fn work(scheduler: &'static Scheduler) {
         reading.end();
         walls_request(&job.request, &result, started);
         stream_log::request(&job, started, &result);
+        if victory_gpu::framelog::on() {
+            let between = |a: Option<std::time::Instant>, b: Option<std::time::Instant>| match (a, b) {
+                (Some(a), Some(b)) => b.saturating_duration_since(a).as_nanos() as u64,
+                _ => 0,
+            };
+            let note = &job.note;
+            victory_gpu::framelog::dstorage(
+                u64::from(job.request.destination_size),
+                between(note.enqueued, note.submitted),
+                between(note.submitted, Some(started)),
+                started.elapsed().as_nanos() as u64,
+            );
+        }
         if let Some(traced) = traced {
             traced.end(&job, &result);
         }
@@ -1065,7 +1078,7 @@ struct Note {
 impl Note {
     fn enqueued(request: &Request) -> Note {
         match trace() {
-            0 if stream_log::on() => Note { enqueued: Some(std::time::Instant::now()), ..Note::default() },
+            0 if stream_log::on() || victory_gpu::framelog::on() => Note { enqueued: Some(std::time::Instant::now()), ..Note::default() },
             0 => Note::default(),
             _ => Note {
                 enqueued: Some(std::time::Instant::now()),
@@ -1077,7 +1090,7 @@ impl Note {
 
     fn submitted(&mut self, request: &Request, early: bool) {
         self.early = early;
-        if trace() > 0 || stream_log::on() {
+        if trace() > 0 || stream_log::on() || victory_gpu::framelog::on() {
             self.submitted = Some(std::time::Instant::now());
         }
         if trace() > 0 {

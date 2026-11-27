@@ -123,6 +123,8 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         tracing::warn!(value, "blocking fence wait not implemented");
         return E_NOTIMPL;
     }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::framelog::fence_event(event as usize);
     waiters.push((value, event as usize));
     S_OK
 }

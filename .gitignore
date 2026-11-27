@@ -86,3 +86,4 @@ Thumbs.db
 *.log
 .env
 .env.*
+__pycache__/

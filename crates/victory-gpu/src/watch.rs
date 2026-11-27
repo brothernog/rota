@@ -174,7 +174,9 @@ static WAITS: [[std::sync::atomic::AtomicU64; 2]; 4] = [const { [const { std::sy
 fn waited<T>(what: usize, f: impl FnOnce() -> T) -> T {
     use std::sync::atomic::Ordering::Relaxed;
     let began = std::time::Instant::now();
+    let framelog = crate::framelog::waiting_guards();
     let got = f();
+    drop(framelog);
     WAITS[what][0].fetch_add(1, Relaxed);
     WAITS[what][1].fetch_add(began.elapsed().as_nanos() as u64, Relaxed);
     got
@@ -2773,6 +2775,7 @@ pub(crate) fn install() {
                 #[cfg(feature = "diagnostics")]
                 {
                     crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+                    crate::framelog::count(crate::framelog::K::GuardFaults, 1);
                     let ns = waited.as_nanos().min(u128::from(u32::MAX)) as usize;
                     let held = (began.elapsed() - waited).as_nanos() as u64;
                     crate::faultbook::note(crate::faultbook::What::Fault, block, opened << 32 | ns, held);

@@ -925,6 +925,8 @@ extern "system" fn present(
     let _ = this;
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
+    #[cfg(all(windows, feature = "diagnostics"))]
+    let _framelog = crate::framelog::presenting();
     let called = crate::timeline::span("the title's Present");
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::timeline::title_thread();
@@ -1053,6 +1055,7 @@ extern "system" fn present(
 /// Diagnostics: the title's present is over.
 #[cfg(all(windows, feature = "diagnostics"))]
 fn frame_ends() {
+    crate::framelog::presented();
     crate::timeline::presented();
     crate::faultbook::frame();
     crate::ab::presented(|switch, was, will| {
@@ -1172,6 +1175,7 @@ extern "system" fn copy_page_mappings(
         return E_INVALIDARG;
     }
     let _called = crate::timeline::span("the title's CopyPageMappings");
+    let mut framelog = crate::framelog::xmem(crate::framelog::Xmem::Queue, 0);
     let batches = (count > 0).then(|| {
         // SAFETY: the title passes `count` batches.
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
@@ -1194,6 +1198,7 @@ extern "system" fn copy_page_mappings(
         let ranges = unsafe { std::slice::from_raw_parts(b.ranges, b.count as usize) };
         let mut at = b.destination;
         for r in ranges {
+            framelog.pages(u64::from(r.count));
             let len = u64::from(r.count) * PAGE;
             let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
             let source = pool + u64::from(r.start) * PAGE;

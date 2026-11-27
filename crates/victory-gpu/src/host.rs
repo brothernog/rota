@@ -3608,6 +3608,10 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     LATE_STATS[why].fetch_add(1, Ordering::Relaxed);
     let was_working = working(false);
     let waiting = std::time::Instant::now();
+    // Always under the submission lock: in a submission, a present's or a
+    // fence's settle.
+    #[cfg(feature = "diagnostics")]
+    let _phase = crate::framelog::phase(crate::framelog::Phase::Landing);
     let _waiting = crate::timeline::span(match why {
         WHY_SYNC => "waiting for landings: everything (a present, the sweep)",
         WHY_VALUE => "waiting for landings: a memory value",
@@ -3714,8 +3718,14 @@ fn relay_worker() {
             }
         };
         match next {
-            Ok(items) => host.relay_land(items, &mut fetch),
+            Ok(items) => {
+                #[cfg(feature = "diagnostics")]
+                let _landing = crate::framelog::relay(2);
+                host.relay_land(items, &mut fetch);
+            }
             Err(target) => {
+                #[cfg(feature = "diagnostics")]
+                let _card = crate::framelog::relay(1);
                 let waiting = std::time::Instant::now();
                 #[cfg(feature = "diagnostics")]
                 let _card = crate::timeline::card_wait(Some(target));
@@ -5742,6 +5752,8 @@ impl Host {
             LATE_STATS[11].fetch_add(flights as u64, Ordering::Relaxed);
             if flights > 0 {
                 submitting(2, flights);
+                #[cfg(feature = "diagnostics")]
+                let phase = crate::framelog::phase(crate::framelog::Phase::Card);
                 let waiting = std::time::Instant::now();
                 // SAFETY: the fence and event are ours, under the
                 // submission lock; `submitted` is the last value signalled.
@@ -5784,6 +5796,8 @@ impl Host {
                     ));
                 }
                 submitting(3, flights);
+                #[cfg(feature = "diagnostics")]
+                phase.set(crate::framelog::Phase::Back);
                 let copying = std::time::Instant::now();
                 let mut seen = std::collections::HashSet::new();
                 let mut back: Vec<Declared> = Vec::new();
@@ -5895,6 +5909,8 @@ impl Host {
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::submission_begins();
+        #[cfg(feature = "diagnostics")]
+        let _framelog = crate::framelog::enter(crate::framelog::State::Submit);
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut stage = crate::timeline::span("submit: the submission lock");
@@ -5905,6 +5921,12 @@ impl Host {
         let ahead = Split::begin();
         #[cfg(feature = "diagnostics")]
         SPLIT[11].fetch_add(called.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        let phase = {
+            crate::framelog::count(crate::framelog::K::Submissions, 1);
+            crate::framelog::count(crate::framelog::K::SubmitLockNs, called.elapsed().as_nanos() as u64);
+            crate::framelog::phase(crate::framelog::Phase::Preparing)
+        };
         stage.next("submit: steps given to the card");
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
@@ -6198,6 +6220,8 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
         submitting(2, runs.len());
+        #[cfg(feature = "diagnostics")]
+        phase.set(crate::framelog::Phase::Card);
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -6282,6 +6306,8 @@ impl Host {
             ));
         }
         submitting(3, runs.len());
+        #[cfg(feature = "diagnostics")]
+        phase.set(crate::framelog::Phase::Back);
         stage.next("submit: copying back");
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
