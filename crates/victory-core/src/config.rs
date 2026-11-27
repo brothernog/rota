@@ -1,9 +1,10 @@
-//! Where the user's files live.
+//! User configuration for paths and GPU selection.
 //!
 //! Resolution order for each value: environment variable, then the config
 //! file (`VICTORY_CONFIG`, else `./victory.toml`), then the default.
 //! See `victory.example.toml` at the repository root.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -13,6 +14,8 @@ use crate::policy::ensure_outside_repo;
 
 #[derive(Debug, Default, Clone)]
 pub struct Config {
+    /// Zero-based DXGI adapter index, if explicitly selected.
+    pub adapter: Option<u32>,
     /// The user's dump of the title.
     pub game_dir: Option<PathBuf>,
     /// Root for all derived data. Always outside the repository.
@@ -30,7 +33,15 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 struct FileConfig {
     #[serde(default)]
+    gpu: FileGpu,
+    #[serde(default)]
     paths: FilePaths,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileGpu {
+    adapter: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -46,6 +57,17 @@ struct FilePaths {
 impl Config {
     /// Loads configuration from the environment and the config file.
     pub fn load() -> Result<Self> {
+        let (source, file) = Self::load_file()?;
+        Self::resolve(file, source, |k| std::env::var_os(k))
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn load_adapter() -> Result<Option<u32>> {
+        let (_, file) = Self::load_file()?;
+        adapter_index(file.gpu.adapter, std::env::var_os("VICTORY_ADAPTER"))
+    }
+
+    fn load_file() -> Result<(Option<PathBuf>, FileConfig)> {
         let explicit = explicit_config_path(|k| std::env::var_os(k));
         let path = explicit
             .clone()
@@ -62,22 +84,23 @@ impl Config {
         } else {
             None
         };
-        let (source, parsed) = match file {
+        Ok(match file {
             Some((path, text)) => {
                 let parsed: FileConfig =
                     toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
                 (Some(path), parsed)
             }
             None => (None, FileConfig::default()),
-        };
-        Self::resolve(parsed.paths, source, |k| std::env::var_os(k))
+        })
     }
 
     fn resolve(
-        file: FilePaths,
+        file: FileConfig,
         source: Option<PathBuf>,
-        env: impl Fn(&str) -> Option<std::ffi::OsString>,
+        env: impl Fn(&str) -> Option<OsString>,
     ) -> Result<Self> {
+        let adapter = adapter_index(file.gpu.adapter, env("VICTORY_ADAPTER"))?;
+        let file = file.paths;
         let env_path = |k: &str| env(k).filter(|v| !v.is_empty()).map(PathBuf::from);
         let test_titles = match env("VICTORY_TEST_TITLES") {
             Some(v) if !v.is_empty() => std::env::split_paths(&v)
@@ -92,6 +115,7 @@ impl Config {
             .or(file.data_dir)
             .map_or_else(|| default_dir("data"), Ok)?;
         Ok(Config {
+            adapter,
             game_dir: env_path("VICTORY_GAME_DIR").or(file.game_dir),
             cache_dir,
             data_dir,
@@ -117,6 +141,17 @@ impl Config {
     pub fn data_subdir(&self, sub: &str) -> Result<PathBuf> {
         subdir(&self.data_dir, sub)
     }
+}
+
+fn adapter_index(file: Option<u32>, env: Option<OsString>) -> Result<Option<u32>> {
+    let Some(env) = env.filter(|v| !v.is_empty()) else {
+        return Ok(file);
+    };
+    Ok(Some(
+        env.to_str().and_then(|value| value.parse().ok()).context(
+            "VICTORY_ADAPTER must be a zero-based adapter index; see `victory adapters`",
+        )?,
+    ))
 }
 
 /// The config file explicitly named by the environment, if any. An empty
@@ -150,10 +185,29 @@ mod tests {
     use std::ffi::OsString;
 
     #[test]
+    fn adapter_uses_env_then_toml() {
+        let file: FileConfig = toml::from_str("[gpu]\nadapter = 1").unwrap();
+        let index = file.gpu.adapter;
+        assert_eq!(adapter_index(None, None).unwrap(), None);
+        assert_eq!(adapter_index(index, None).unwrap(), Some(1));
+        assert_eq!(
+            adapter_index(index, Some(OsString::new())).unwrap(),
+            Some(1)
+        );
+        assert_eq!(adapter_index(index, Some("0".into())).unwrap(), Some(0));
+        for invalid in ["-1", "gpu", "4294967296"] {
+            assert!(adapter_index(index, Some(invalid.into())).is_err());
+        }
+    }
+
+    #[test]
     fn environment_overrides_file() {
-        let file = FilePaths {
-            game_dir: Some("from-file".into()),
-            cache_dir: Some("cache-from-file".into()),
+        let file = FileConfig {
+            paths: FilePaths {
+                game_dir: Some("from-file".into()),
+                cache_dir: Some("cache-from-file".into()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let env = |k: &str| (k == "VICTORY_GAME_DIR").then(|| OsString::from("from-env"));
@@ -164,8 +218,11 @@ mod tests {
 
     #[test]
     fn empty_env_values_are_ignored() {
-        let file = FilePaths {
-            game_dir: Some("from-file".into()),
+        let file = FileConfig {
+            paths: FilePaths {
+                game_dir: Some("from-file".into()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let env = |k: &str| (k == "VICTORY_GAME_DIR").then(OsString::new);
@@ -175,8 +232,11 @@ mod tests {
 
     #[test]
     fn empty_test_titles_env_is_ignored() {
-        let file = FilePaths {
-            test_titles: vec!["from-file".into()],
+        let file = FileConfig {
+            paths: FilePaths {
+                test_titles: vec!["from-file".into()],
+                ..Default::default()
+            },
             ..Default::default()
         };
         let env = |k: &str| (k == "VICTORY_TEST_TITLES").then(OsString::new);
@@ -187,7 +247,7 @@ mod tests {
     #[test]
     fn test_titles_env_splits_paths() {
         let value = std::env::join_paths(["first", "second"]).unwrap();
-        let file = FilePaths::default();
+        let file = FileConfig::default();
         let env = |k: &str| (k == "VICTORY_TEST_TITLES").then(|| value.clone());
         let cfg = Config::resolve(file, None, env).unwrap();
         assert_eq!(

@@ -116,6 +116,34 @@ by a run with `VICTORY_PIPELINE_BOOK=1`. So the first run is cold (dropped draws
 picture), then warm, then run again. The warm-up's bookkeeping is kept per card, so after
 switching cards `warm --used` makes that card's pipelines on its own.
 
+### Choose a GPU
+
+To choose a GPU, list the available adapters and use the zero-based index of the one you want.
+The list shows the adapter name, dedicated video memory, and whether it can create a D3D12
+feature level 12_0 device. Run the listing again after adding or removing a GPU.
+
+```powershell
+target\diag\victory.exe adapters
+$env:VICTORY_ADAPTER = '0'  # replace 0 with the desired index
+```
+
+For a persistent setting, add this to `victory.toml` and use the index from your list.
+
+```toml
+[gpu]
+adapter = 0
+```
+
+`VICTORY_ADAPTER` overrides the TOML value. Run `victory.exe config` to see the resolved
+`gpu.adapter` setting. To return to automatic selection, clear the environment variable
+with `Remove-Item Env:VICTORY_ADAPTER` and omit `adapter` from the TOML file.
+
+The choice applies to `run`, `warm` and its workers, `replay`, and `translate --pipelines`.
+When switching GPUs, select the new index before running `warm --used` and keep it set
+for the subsequent `run`.
+
+### Run settings
+
 The settings the numbers above were measured with are the defaults: `victory.exe` sets each one
 you have not set yourself, for `shaders`, `warm` and `run` alike (it prints which), and
 `VICTORY_TUNED=0` sets none. They are listed in [`apps/victory/src/tuned.rs`](apps/victory/src/tuned.rs):

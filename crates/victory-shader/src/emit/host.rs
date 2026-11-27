@@ -63,7 +63,7 @@ fn err(e: windows::core::Error) -> String {
 }
 
 impl Host {
-    /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
+    /// The selected adapter, falling back to the default or requested WARP.
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
@@ -79,7 +79,9 @@ impl Host {
                 }
             }
             let mut device: Option<ID3D12Device> = None;
-            if warp {
+            if let Some(adapter) = victory_core::adapter::selected().map_err(|e| e.to_string())? {
+                D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+            } else if warp {
                 let factory: IDXGIFactory4 =
                     CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
                 let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
