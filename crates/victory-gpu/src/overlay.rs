@@ -89,6 +89,8 @@ fn spread(rates: &VecDeque<f64>) -> Option<(f64, f64, f64)> {
 /// What the panel and the CSV show.
 #[derive(Clone, Default)]
 struct Stats {
+    /// Seconds since the overlay started: the CSV's `t_s` clock.
+    t: f64,
     frame: Frame,
     half_minute: Option<(f64, f64, f64)>,
     cpu: f64,
@@ -233,6 +235,7 @@ fn sample(cpu: &mut Cpu, gpu: Option<&Gpu3d>, adapter: Option<&IDXGIAdapter3>, n
         Some([own.Budget, own.CurrentUsage, shared.Budget, shared.CurrentUsage].map(|b| b as f64 / GB))
     });
     Stats {
+        t: 0.0,
         frame: FRAME.lock().unwrap_or_else(|e| e.into_inner()).unwrap_or_default(),
         half_minute: spread(&RATES.lock().unwrap_or_else(|e| e.into_inner())),
         cpu: cpu.percent(),
@@ -449,6 +452,7 @@ fn rate(r: f64) -> String {
 fn rows(s: &Stats) -> Vec<Option<(&'static str, String, [u8; 3])>> {
     let f = &s.frame;
     let mut rows = vec![
+        Some(("Run time", format!("t {:.0} s", s.t), WHITE)),
         Some(("30 s low / avg / high", s.half_minute.map_or("...".into(), |(l, m, h)| format!("{} / {} / {}", rate(l), rate(m), rate(h))), WHITE)),
         Some(("Preparing (CPU)", format!("{:.0} ms", f.preparing), WHITE)),
         Some(("  copies", format!("{:.0} ms \u{b7} {:.0} MB", f.copy_ms, f.copy_mb), WHITE)),
@@ -646,12 +650,13 @@ fn run(game: HWND, adapter: Option<IDXGIAdapter3>) {
         SetTimer(window, REFRESH, 500, None);
         SetTimer(window, KEYS, 40, None);
         let mut refresh = |cpu: &mut Cpu| {
-            let stats = sample(cpu, gpu.as_ref(), adapter.as_ref(), &names);
+            let mut stats = sample(cpu, gpu.as_ref(), adapter.as_ref(), &names);
+            stats.t = started.elapsed().as_secs_f64();
             let ticks = TICKS.load(Ordering::Relaxed);
             if ticks != written {
                 written = ticks;
                 if let Some(f) = csv.as_mut()
-                    && writeln!(f, "{}", csv_row(started.elapsed().as_secs_f64(), &stats)).is_err()
+                    && writeln!(f, "{}", csv_row(stats.t, &stats)).is_err()
                 {
                     csv = None;
                 }
@@ -716,5 +721,11 @@ mod tests {
         assert!(row.starts_with("2.0,1.50,"), "{row}");
         // No VRAM figures: empty cells, still numbers-only.
         assert!(row.ends_with(",,,"), "{row}");
+    }
+
+    #[test]
+    fn run_time_row_reads_the_csv_clock() {
+        let s = Stats { t: 186.6, ..Stats::default() };
+        assert!(rows(&s).iter().flatten().any(|(_, v, _)| v == "t 187 s"));
     }
 }
