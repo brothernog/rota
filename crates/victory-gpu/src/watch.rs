@@ -320,13 +320,6 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         .filter(|r| r.0 < r.1 && !published(r.0, r.1))
         .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
         .collect();
-    // View memory the guards know is left to `writes`, which answers it from
-    // the guards: asked here it fails, is asked again by halves, and fails
-    // once more in `writes` ([`view_known`]).
-    if view_known() {
-        let g = guards();
-        pieces.retain(|&(first, _)| !known_view_block(&g, first * PAGE / BLOCK));
-    }
     if pieces.len() < 2 {
         return;
     }
@@ -335,6 +328,16 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     // hold is left to `writes`.
     if journal().kept {
         return;
+    }
+    // View memory the guards know is left to `writes`, which answers it from
+    // the guards: asked here it fails, is asked again by halves, and fails
+    // once more in `writes` ([`view_known`]).
+    if view_known() {
+        let g = guards();
+        pieces.retain(|&(first, _)| !known_view_block(&g, first * PAGE / BLOCK));
+        if pieces.len() < 2 {
+            return;
+        }
     }
     let _all = Asking::hold_all();
     let (mut asked, mut written) = (Vec::new(), Vec::new());
@@ -1448,9 +1451,11 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
 /// guard is open (`VICTORY_VIEW_KNOWN=1`; off by default): a range whose first
 /// block the title wrote since its last check is then not asked of the
 /// kernel's write watch (which can only refuse view memory), nor of Windows
-/// (`is_view`, a walk of the page tables). Forgotten when the title frees the
-/// memory ([`title_memory_freed`]); the runtime's mappings and unmappings
-/// leave view memory or a hole in it, which is what `is_view` answers for.
+/// (`is_view`, a walk of the page tables). The runtime mapping a section's
+/// pages there makes blocks known too ([`title_memory_remapped`]); its
+/// unmapping them ([`title_memory_unmapping`]) and the title freeing the
+/// memory ([`title_memory_freed`]) forget them: a hole may be given up and
+/// be other memory with no word of the runtime's.
 ///
 /// After KomanderDG88/VIniVIdiVIci f644da3 (`VICTORY_VIEW_KNOWN`; there
 /// 338-450 refused askings a frame and 6.5-7.8 ms a frame of the submitting
@@ -2500,7 +2505,12 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// write access is given back.
 pub fn title_memory_remapped(at: usize, len: usize) {
     crate::texback::remapped(at, len);
-    open(&mut title_memory_changed(at, len), at, at.saturating_add(len));
+    let mut g = title_memory_changed(at, len);
+    // A section's pages just mapped there: view memory ([`view_known`]).
+    if view_known() && len < 1 << 40 {
+        g.viewed.insert_all(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK));
+    }
+    open(&mut g, at, at.saturating_add(len));
 }
 
 /// The runtime is about to unmap title memory `[at, at + len)`: it is
@@ -2526,6 +2536,12 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
         PUBLISHED.clear(block);
         PROTECTED.clear(block);
     }
+    // A hole from now on, which may be given up and be other memory with no
+    // word of the runtime's: no longer known as a view ([`view_known`]).
+    let viewed: Vec<usize> = g.viewed.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).collect();
+    for block in viewed {
+        g.viewed.remove(block);
+    }
 }
 
 /// The title is about to free or decommit memory of its own,
@@ -2535,7 +2551,7 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 pub fn title_memory_freed(at: usize, len: usize) {
     let mut g = guards();
     let first = at / BLOCK;
-    if view_known() {
+    if view_known() && g.viewed.range(first..).next().is_some() {
         // Memory of the title's own, no view: known as one no longer.
         let end = if len != 0 { at.saturating_add(len).div_ceil(BLOCK) } else { allocation_end(at, at).div_ceil(BLOCK).max(first + 1) };
         let viewed: Vec<usize> = g.viewed.range(first..end).collect();
@@ -2614,15 +2630,9 @@ fn title_memory_changed(at: usize, len: usize) -> std::sync::MutexGuard<'static,
     for block in foreign {
         g.foreign.remove(&block);
     }
-    let aliased: Vec<usize> = g.aliased.range(range.clone()).collect();
+    let aliased: Vec<usize> = g.aliased.range(range).collect();
     for block in aliased {
         g.aliased.remove(block);
-    }
-    // The runtime tells of two things only, a section's pages just mapped
-    // there or a view about to be a placeholder again: view memory or a hole
-    // in it either way ([`view_known`]).
-    if view_known() {
-        g.viewed.insert_all(range);
     }
     g
 }
@@ -2971,6 +2981,12 @@ mod tests {
         let (now, found) = writes(at, at + BLOCK, true).expect("a view");
         assert!(found.contains(&(at / PAGE, now)), "{found:?} at {now}");
         title_memory_freed(at, 2 * BLOCK);
+        assert!(!guards().viewed.contains(at / BLOCK) && !guards().viewed.contains(at / BLOCK + 1));
+        // The runtime mapping pages there makes them known; unmapping them,
+        // a hole that may become other memory, forgets them.
+        title_memory_remapped(at, 2 * BLOCK);
+        assert!(guards().viewed.contains(at / BLOCK + 1));
+        title_memory_unmapping(at, 2 * BLOCK);
         assert!(!guards().viewed.contains(at / BLOCK) && !guards().viewed.contains(at / BLOCK + 1));
         VIEW_KNOWN_HERE.set(false);
         title_memory_unmapping(at, 2 * BLOCK);
