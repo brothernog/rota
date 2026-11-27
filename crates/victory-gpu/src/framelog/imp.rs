@@ -972,6 +972,7 @@ pub(crate) fn header() -> String {
     for i in 1..=TOP {
         let _ = std::fmt::Write::write_fmt(&mut h, format_args!(",list_top{i}_line,list_top{i}_ms,list_top{i}_calls"));
     }
+    h.push_str(",menu_bits");
     h
 }
 
@@ -1118,6 +1119,11 @@ impl Looker {
         for i in 0..TOP {
             let (ns, calls, line) = sites.get(i).copied().unwrap_or((0, 0, 0));
             let _ = write!(row, ",{line},{:.2},{calls}", ns as f64 / 1e6);
+        }
+        // The switches menu's state at the line (empty without the menu).
+        row.push(',');
+        if crate::ab::menu() {
+            let _ = write!(row, "{}", crate::ab::menu_bits());
         }
         row
     }
@@ -1350,7 +1356,7 @@ mod tests {
     #[test]
     fn the_header_names_every_column() {
         let h = header();
-        assert_eq!(h.split(',').count(), 4 + BUCKETS.len() + 5 + NAMES.len() + 8 + 5 + 3 * TOP);
+        assert_eq!(h.split(',').count(), 4 + BUCKETS.len() + 5 + NAMES.len() + 8 + 5 + 3 * TOP + 1);
         assert!(h.contains(",xmem_title_ms,") && h.contains(",unexplained,") && !h.contains("_ns"));
     }
 }

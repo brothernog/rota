@@ -198,6 +198,15 @@ def report(path, seconds, start=None, end=None):
     print(f"\npeaks ({len(peaks)}: frames <= {FAST}x the median around them), longest first:")
     for run in sorted(peaks, key=len, reverse=True)[:10]:
         print('  ' + describe(rows, run, medians))
+    states = sorted({int(r['menu_bits']) for r in rows if r.get('menu_bits') is not None})
+    if len(states) > 1:
+        print("\nby the switches menu's state (menu_bits; median fps; ms/frame by bucket, the four largest):")
+        for state in states:
+            group = [r for r in rows if r.get('menu_bits') is not None and int(r['menu_bits']) == state]
+            tot = sums(group, range(len(group)), BUCKETS + ['wall_ms'])
+            top = sorted(BUCKETS, key=lambda b: -tot[b])[:4]
+            fps = 1000 / statistics.median([r['wall_ms'] for r in group])
+            print(f"  {state:#x}: {len(group)} frames, {fps:.2f} fps; " + ', '.join(f"{b} {tot[b] / len(group):.0f}" for b in top))
     print(f"\nwindows of {seconds:.0f} s (median fps; ms/frame by bucket, the four largest; unknown %):")
     for group in windows(rows, seconds):
         idx = range(len(group))
