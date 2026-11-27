@@ -2114,7 +2114,7 @@ fn dword_runs(at: usize, title: &[u8], merged: &[u8], gap: usize) -> Vec<(usize,
 /// 12 MB this way and finds 80,000 runs.
 fn word_runs(at: usize, title: &[u8], held: &[u8]) -> Vec<(usize, usize)> {
     #[cfg(target_arch = "x86_64")]
-    if at % 4 == 0 && title.len() % 4 == 0 && title.len() == held.len() && std::arch::is_x86_feature_detected!("avx2") {
+    if at.is_multiple_of(4) && title.len().is_multiple_of(4) && title.len() == held.len() && std::arch::is_x86_feature_detected!("avx2") {
         // SAFETY: the processor has AVX2, and the lengths are the same.
         return unsafe { word_runs_avx2(title, held) };
     }
@@ -4721,7 +4721,7 @@ mod land_tests {
             });
             let mut now = vec![0u8; LEN];
             for round in 1..200u32 {
-                for block in (0..BLOCKS).filter(|b| (*b as u32 * 5 + round) % 3 != 0) {
+                for block in (0..BLOCKS).filter(|b| !(*b as u32 * 5 + round).is_multiple_of(3)) {
                     for i in (block * PIECE / 4 + 3..(block + 1) * PIECE / 4).step_by(4) {
                         now[i * 4..i * 4 + 4].copy_from_slice(&(round << 20 | i as u32).to_le_bytes());
                     }
@@ -4975,6 +4975,12 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
         let big = cards() && (size >= card_limits().0 || card_all());
+        // Renderer port 1 (`crate::port`, `VICTORY_PORT_CONSTANTS=1`): the
+        // title's 32-bit graphics heap in place, big or not.
+        if let Some(placed) = crate::port::place_for(key.0, len, false) {
+            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+            return entry.shadow.clone();
+        }
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
@@ -5282,7 +5288,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     }
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
-    if let Some(placed) = crate::inplace::place_for(start, len, true) {
+    if let Some(placed) = crate::port::place_for(start, len, true).or_else(|| crate::inplace::place_for(start, len, true)) {
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
         map.insert((start, len), shadow.clone());

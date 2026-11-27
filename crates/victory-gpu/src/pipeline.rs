@@ -359,9 +359,15 @@ fn names_are_found_by_hash() {
 /// geometry made for them (8 % of the card's time in upstream's cutscene
 /// run). The tracing programs' fallback forms march through the title's
 /// voxels instead and light the picture, so they run.
+///
+/// `ShadowMask`: three kinds of programs that trace the shadows of the
+/// screen tiles the title marks for rays (the cascades' shadow edges, hair).
+/// With every ray a miss those tiles come out lit, so leaving them out is a
+/// picture change: opt-in (`VICTORY_SKIP_RT_SHADOW=1`). After edsuuu/VI-BR-PORT
+/// a04f601.
 #[cfg(windows)]
 fn for_rays(bytes: &[u8]) -> RayOnly {
-    const NAMES: [Named; 8] = [
+    const NAMES: [Named; 11] = [
         Named { lead: *b"CSC", len: 17, hash: 0x75d5_4989_f655_36c7 },
         Named { lead: *b"CSG", len: 16, hash: 0x88d5_868b_21ac_f0a8 },
         Named { lead: *b"CS_", len: 20, hash: 0x6854_1240_ea05_c84a },
@@ -370,6 +376,9 @@ fn for_rays(bytes: &[u8]) -> RayOnly {
         Named { lead: *b"_BV", len: 4, hash: 0x2f04_bb42_f945_4ada },
         Named { lead: *b"CS_", len: 18, hash: 0x5e61_2445_d69c_1403 },
         Named { lead: *b"Vox", len: 6, hash: 0x215e_0fd8_d761_edac },
+        Named { lead: *b"CS_", len: 32, hash: 0xa5aa_6988_0a5d_466c },
+        Named { lead: *b"CS_", len: 16, hash: 0xccd9_2523_66d8_8f47 },
+        Named { lead: *b"CS_", len: 18, hash: 0x9e50_2caf_b7bf_b5da },
     ];
     let has = |i: usize| NAMES[i].is_in(bytes);
     if has(0) || has(1) {
@@ -380,6 +389,8 @@ fn for_rays(bytes: &[u8]) -> RayOnly {
         RayOnly::Activate
     } else if (has(4) && has(5)) || (has(6) && !has(7)) {
         RayOnly::Trace
+    } else if has(8) || has(9) || has(10) {
+        RayOnly::ShadowMask
     } else {
         RayOnly::No
     }
@@ -394,13 +405,14 @@ enum RayOnly {
     Resolve,
     Activate,
     Trace,
+    ShadowMask,
 }
 
 /// Whether a dispatch of `this` is left out because it only serves rays,
 /// and nothing they could hit is there: every ray is a miss
 /// (`VICTORY_RT_MISS=1`) and the structure builder is off. Each kind runs
 /// anyway with its switch: `VICTORY_RT_SKIN=1`, `VICTORY_RT_RESOLVE=1`, `VICTORY_RT_TRACE=1`,
-/// `VICTORY_ACTIVATE_RAYS=1`.
+/// `VICTORY_ACTIVATE_RAYS=1`; the shadow kind runs unless `VICTORY_SKIP_RT_SHADOW=1`.
 #[cfg(windows)]
 pub(crate) fn skips_rt_skin(this: This) -> bool {
     fn off(switch: &str) -> bool {
@@ -412,6 +424,7 @@ pub(crate) fn skips_rt_skin(this: This) -> bool {
     static RESOLVE: OnceLock<bool> = OnceLock::new();
     static ACTIVATE: OnceLock<bool> = OnceLock::new();
     static TRACE: OnceLock<bool> = OnceLock::new();
+    static SHADOW: OnceLock<bool> = OnceLock::new();
     if this.is_null() {
         return false;
     }
@@ -421,6 +434,10 @@ pub(crate) fn skips_rt_skin(this: This) -> bool {
         RayOnly::Resolve => *RESOLVE.get_or_init(|| off("VICTORY_RT_RESOLVE")),
         RayOnly::Activate => *ACTIVATE.get_or_init(|| off("VICTORY_ACTIVATE_RAYS")),
         RayOnly::Trace => *TRACE.get_or_init(|| off("VICTORY_RT_TRACE")),
+        // Opt-in: it changes the picture (`VICTORY_SKIP_RT_SHADOW=1`).
+        RayOnly::ShadowMask => *SHADOW.get_or_init(|| {
+            std::env::var_os("VICTORY_SKIP_RT_SHADOW").is_some_and(|v| v == "1") && off("VICTORY_RT_SHADOW")
+        }),
     }
 }
 
@@ -929,6 +946,7 @@ pub fn save_pipeline_cache() {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]

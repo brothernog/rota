@@ -2634,6 +2634,9 @@ struct Flight {
 }
 
 /// One thing in the line of what waits for the card, in order.
+// A flight is the common case and lives here by value; boxing it would cost an allocation per
+// submission for the rarer, smaller variants' sake.
+#[allow(clippy::large_enum_variant)]
 enum Late {
     Run(Flight),
     /// A bottom-of-pipe write of the flight before it: address, what, bytes.
@@ -2860,7 +2863,7 @@ fn blame_stale(stale: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)]) 
 /// title memory read, took `us`.
 #[cfg(feature = "diagnostics")]
 fn blamed(why: usize, us: u64) {
-    let (named, refused) = std::mem::replace(&mut *BLAMED.lock().unwrap_or_else(|e| e.into_inner()), (None, ""));
+    let (named, refused) = std::mem::take(&mut *BLAMED.lock().unwrap_or_else(|e| e.into_inner()));
     let (key, at) = match (why, named) {
         (WHY_READ | WHY_STALE, Some(named)) => named,
         (WHY_READ, None) => (("a host copy of what a copy done on the card wrote", refused, 0, 0, 0), 0),
@@ -3643,6 +3646,7 @@ fn late_line(frames: f64) {
         );
     }
     card_steps::log(frames);
+    crate::port::log(frames);
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
@@ -3659,6 +3663,7 @@ fn late_line(frames: f64) {
 pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
+#[cfg(any(test, feature = "diagnostics"))]
 pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
 mod panel;
@@ -4456,17 +4461,44 @@ impl Host {
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                    // Ranges of one copy whose pieces and result places follow each other,
+                    // in one mode, go in one pass (`VICTORY_CARD_COMPARE_JOIN=1`; off: a pass each).
+                    let join = compare_join();
+                    let mut pending: Option<(u64, u64, u32, crate::shadow::CardSpan, u32, u32)> = None;
+                    let flush = |p: Option<(u64, u64, u32, crate::shadow::CardSpan, u32, u32)>| {
+                        if let Some((buffer, before, size, span, at, mode)) = p {
+                            list.SetComputeRootShaderResourceView(1, buffer);
+                            list.SetComputeRootUnorderedAccessView(2, before);
+                            card_pass(list, &span, size, at, mode);
+                            CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
+                        }
+                    };
                     for r in plan.ranges.iter().filter(|r| r.compared) {
                         let (Some((_, Some(before), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) else {
                             continue;
                         };
-                        list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+                        let (buffer, before_at) = (r.shadow.buffer.GetGPUVirtualAddress(), before.GetGPUVirtualAddress());
                         // (What is only looked at keeps its hashes: what
                         // changed there is the next declared range's to land.)
-                        card_pass(list, &r.span, size as u32, r.at, if flown && !r.picked { 2 } else { 1 });
-                        CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
+                        let mode = if flown && !r.picked { 2 } else { 1 };
+                        if join
+                            && let Some((b, h, s, span, at, m)) = pending.as_mut()
+                            && *b == buffer
+                            && *h == before_at
+                            && *s == size as u32
+                            && *m == mode
+                            && span.skew == r.span.skew
+                            && span.first + span.pieces == r.span.first
+                            && *at + span.pieces == r.at
+                        {
+                            span.pieces += r.span.pieces;
+                            span.to = r.span.to;
+                            continue;
+                        }
+                        flush(pending.take());
+                        pending = Some((buffer, before_at, size as u32, r.span, r.at, mode));
                     }
+                    flush(pending.take());
                     list.Close()?;
                     list.cast()
                 })()
@@ -7304,6 +7336,7 @@ impl HostList {
                     }
                     batch.fill();
                     batch.title_written();
+                    crate::port::copied(dst, src, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
@@ -7319,6 +7352,7 @@ impl HostList {
                     {
                         copies += 1;
                     }
+                    crate::port::filled(src, len);
                     if wide_fills() {
                         batch.fills.push((dst, src, len));
                         bytes += len as u64;
@@ -7735,7 +7769,8 @@ enum Touch {
     Refresh(usize, usize, usize),
     /// The copy is given to shaders.
     Write(usize),
-    /// Title memory is written.
+    /// Title memory is written. (Only the tests give one: the host stops its steps there instead.)
+    #[cfg_attr(not(test), allow(dead_code))]
     Title,
     Nothing,
     /// Another part of the submission begins.
@@ -9279,6 +9314,7 @@ impl Host {
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+        slow_frame(frame);
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -10976,3 +11012,34 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     }
 }
 
+
+/// Whether the compares of ranges of one copy in the card's memory whose
+/// pieces and result places follow each other go in one pass
+/// (`VICTORY_CARD_COMPARE_JOIN=1`; off by default: a pass each). Some 390 compare passes a
+/// frame in a busy scene, each one dispatch.
+// After edsuuu/VI-BR-PORT 2f59f1d.
+fn compare_join() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_COMPARE_JOIN").is_some_and(|v| v == "1"))
+}
+
+/// A frame that took long, said in the log on its own (the frame line every few seconds only gives
+/// the mean, and a single hitch disappears in it): over 100 ms a warning, over 500 ms an error,
+/// with the time since the last present. Off unless `VICTORY_SLOW_FRAME_LOG=1`.
+/// After edsuuu/VI-BR-PORT 341073e.
+fn slow_frame(frame: u64) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_SLOW_FRAME_LOG").is_some_and(|v| v == "1")) {
+        return;
+    }
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    let now = std::time::Instant::now();
+    let before = LAST.lock().unwrap_or_else(|e| e.into_inner()).replace(now);
+    let Some(before) = before else { return };
+    let ms = now.duration_since(before).as_secs_f64() * 1e3;
+    if ms > 500.0 {
+        tracing::error!(frame, ms = format_args!("{ms:.0}"), "slow frame: {ms:.0} ms (30 fps is 33 ms)");
+    } else if ms > 100.0 {
+        tracing::warn!(frame, ms = format_args!("{ms:.0}"), "slow frame: {ms:.0} ms (30 fps is 33 ms)");
+    }
+}
