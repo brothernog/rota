@@ -39,6 +39,8 @@ pub(crate) struct Indirects {
 }
 
 /// A list's, shared with the report's table of lists.
+/// (Only the diagnostics build has that table; the tests build the module without it.)
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) type Shared = Arc<Mutex<Indirects>>;
 
 impl Indirects {

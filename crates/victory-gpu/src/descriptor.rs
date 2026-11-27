@@ -1642,7 +1642,7 @@ mod tests {
         };
         let made = state.tables(&list, &[range], &[], &[(1, 8)], true);
         let [(1, offset)] = made[..] else {
-            panic!("one fresh table for root parameter 1, not {made:?}");
+            panic!("expected one fresh table for root parameter 1, got {:?}", &made[..]);
         };
         assert_ne!(offset, u32::MAX, "the table found no dynamic slots");
         let next = host_heap.dynamic(1).expect("a dynamic slot");

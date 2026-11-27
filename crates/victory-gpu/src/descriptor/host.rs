@@ -5336,7 +5336,7 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         compact(&mut ranges, 8);
         assert!(ranges.len() <= 4);
         for i in 0..10u64 {
-            assert!(ranges.iter().any(|r| r.0 <= i * 10 && i * 10 + 1 <= r.1), "change {i} lost");
+            assert!(ranges.iter().any(|r| r.0 <= i * 10 && i * 10 < r.1), "change {i} lost");
         }
         let mut touching = vec![(0, 5), (5, 9), (20, 30)];
         compact(&mut touching, 4);
