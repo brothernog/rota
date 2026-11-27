@@ -2308,7 +2308,10 @@ static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 /// What the runtime holds while it changes what title memory shows
 /// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+pub struct Remapping {
+    _mapping: std::sync::RwLockWriteGuard<'static, ()>,
+    _scope: Option<scoped::Permit<'static>>,
+}
 
 impl Drop for Remapping {
     fn drop(&mut self) {
@@ -2450,11 +2453,32 @@ pub(crate) fn lost(what: &'static str, at: usize, len: usize) {
 }
 
 
+mod scoped;
+
+/// `VICTORY_TEXTURE_SCOPED_REMAP=1`: a texture refresh waits only for a
+/// remap of the views that hold its memory, not for any remap
+/// ([`scoped`]; off by default). A remap whose views are not known
+/// ([`title_memory_remapping`]) still waits for every read and holds off all.
+/// Every read, scoped or not, goes through [`scoped::GATE`] then; [`MAPPING`]
+/// only keeps the remaps one at a time.
+pub fn scoped_remap() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SCOPED_REMAP").is_some_and(|v| v == "1"))
+}
+
 /// The runtime is about to map, unmap or move physical pages of title
 /// memory: until what it returns is dropped, no read of title memory in
 /// place is under way and none begins ([`title_memory_reading`]). Taken
 /// around the whole change, the unmapping and the mapping again.
 pub fn title_memory_remapping() -> Remapping {
+    title_memory_remapping_in(|| None)
+}
+
+/// [`title_memory_remapping`] for a change that only touches `areas`: every
+/// whole view it can take away, with the runtime's page table held while
+/// they are worked out. With `VICTORY_TEXTURE_SCOPED_REMAP=1` only reads of
+/// memory there wait; `None` (not known) is all of it.
+pub fn title_memory_remapping_in(areas: impl FnOnce() -> Option<Vec<std::ops::Range<usize>>>) -> Remapping {
     // For the title's own threads ([`came_back`]).
     install();
     let met = MET.load(std::sync::atomic::Ordering::Relaxed);
@@ -2465,32 +2489,71 @@ pub fn title_memory_remapping() -> Remapping {
             tracing::info!(met, "accesses of title threads that waited for a change of mapping");
         }
     }
+    // Announced before waiting for the readers or the other changes.
+    let scope = scoped_remap().then(|| {
+        let areas = areas().filter(|a| !a.is_empty() && a.iter().all(|r| r.start < r.end)).unwrap_or_else(|| vec![scoped::ALL]);
+        scoped::GATE.write(areas)
+    });
     let changing = MAPPING.write().unwrap_or_else(|e| e.into_inner());
     CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     CHANGING.set((true, false));
-    Remapping(changing)
+    Remapping { _mapping: changing, _scope: scope }
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
-pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
+pub struct Reading {
+    _mapping: Option<std::sync::RwLockReadGuard<'static, ()>>,
+    _scope: Option<scoped::Permit<'static>>,
+}
 
 /// For reading title memory in place: until what it returns is dropped,
 /// the runtime changes no mapping, so memory found mapped stays mapped.
 /// Not to be taken twice by one thread, nor held across anything that
 /// maps title memory.
 pub fn title_memory_reading() -> Reading {
-    Reading(MAPPING.read().unwrap_or_else(|e| e.into_inner()))
+    if scoped_remap() {
+        return Reading { _mapping: None, _scope: scoped::GATE.read(scoped::ALL, true) };
+    }
+    Reading { _mapping: Some(MAPPING.read().unwrap_or_else(|e| e.into_inner())), _scope: None }
 }
 
 /// [`title_memory_reading`] if it can be had at once: `None` while the
 /// runtime changes a mapping (or waits to), for a caller that has another
 /// way to read and would rather not wait.
 pub fn title_memory_reading_now() -> Option<Reading> {
+    if scoped_remap() {
+        return scoped::GATE.read(scoped::ALL, false).map(|scope| Reading { _mapping: None, _scope: Some(scope) });
+    }
     match MAPPING.try_read() {
-        Ok(guard) => Some(Reading(guard)),
-        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(e.into_inner())),
+        Ok(guard) => Some(Reading { _mapping: Some(guard), _scope: None }),
+        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading { _mapping: Some(e.into_inner()), _scope: None }),
         Err(std::sync::TryLockError::WouldBlock) => None,
     }
+}
+
+/// The blocks `[start, end)` touches: a view is never smaller than a block.
+fn texture_area(start: usize, end: usize) -> std::ops::Range<usize> {
+    end.checked_next_multiple_of(BLOCK)
+        .map(|stop| (start / BLOCK * BLOCK)..stop)
+        .filter(|r| r.start < r.end)
+        .unwrap_or(scoped::ALL)
+}
+
+/// [`title_memory_reading`] for memory `[start, end)` alone: with
+/// `VICTORY_TEXTURE_SCOPED_REMAP=1` it waits for the remaps of its views only.
+pub(crate) fn texture_reading(start: usize, end: usize) -> Reading {
+    if scoped_remap() {
+        return Reading { _mapping: None, _scope: scoped::GATE.read(texture_area(start, end), true) };
+    }
+    title_memory_reading()
+}
+
+/// [`texture_reading`] if it can be had at once ([`title_memory_reading_now`]).
+pub(crate) fn texture_reading_now(start: usize, end: usize) -> Option<Reading> {
+    if scoped_remap() {
+        return scoped::GATE.read(texture_area(start, end), false).map(|scope| Reading { _mapping: None, _scope: Some(scope) });
+    }
+    title_memory_reading_now()
 }
 
 /// The runtime mapped title memory `[at, at + len)`: what it shows is new,

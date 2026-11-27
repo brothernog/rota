@@ -413,7 +413,11 @@ pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 4] = [const { std::sy
 /// submitting thread is not running while it lasts (run 93: 240-310 ms of
 /// its own time a frame beside 1,100-1,800 ms of "textures"): it waits.
 /// These say for what.
-pub(crate) static REFRESH_WAITS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+///
+/// Place 4: of place 2, the time spent in the scoped remap lock
+/// (`VICTORY_TEXTURE_SCOPED_REMAP=1`, [`crate::watch::scoped_remap`]); 0 with
+/// the switch off.
+pub(crate) static REFRESH_WAITS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// `f`'s result, its time added to [`REFRESH_WAITS`]' place `slot`.
 fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
@@ -1330,12 +1334,15 @@ impl Staging {
             // Not waited for: while the runtime remaps title memory the
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
-            let Some(mapped) = crate::watch::title_memory_reading_now() else {
+            let Some(mapped) = crate::watch::texture_reading_now(start, start + size) else {
                 return self.refresh_unlocked(last, size);
             };
             mapped
+        } else if crate::watch::scoped_remap() {
+            // Slot 4: the part of slot 2 spent behind the scoped lock.
+            waited(2, || waited(4, || crate::watch::texture_reading(start, start + size)))
         } else {
-            waited(2, crate::watch::title_memory_reading)
+            waited(2, || crate::watch::texture_reading(start, start + size))
         };
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages
