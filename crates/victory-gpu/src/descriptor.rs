@@ -667,7 +667,7 @@ pub(crate) fn slot_shows(heap: usize, index: u32) -> Option<usize> {
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
     {
-        return host.shows(index);
+        return host.kept_in(index).map(|r| windows::core::Interface::as_raw(&r) as usize);
     }
     None
 }

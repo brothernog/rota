@@ -1551,5 +1551,15 @@ mod tests {
         eprintln!("{done} of 48 copies were done on the card, {} submissions waited", DONE[3].load(Ordering::Relaxed));
         eprintln!("settles for title memory under shader writes: {}", LATE_STATS[WHY_STALE].load(Ordering::Relaxed));
         assert!(done >= 20, "only {done} copies were done on the card");
+        // With `VICTORY_STEP_CHECK=1` or `2`: every step looked at, none wrong.
+        if check() > 0 {
+            let checked = CHECKED.lock().unwrap().take().unwrap_or_default();
+            let mut n = [0u64; 4];
+            for (counts, ..) in checked.values() {
+                (0..4).for_each(|i| n[i] += counts[i]);
+            }
+            eprintln!("checked: {n:?} (alike, landed, wrong, unsure), {} undone", LOST.load(Ordering::Relaxed));
+            assert!(n[0] + n[1] > 0 && n[2] == 0, "{n:?}");
+        }
     }
 }

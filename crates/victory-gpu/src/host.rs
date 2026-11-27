@@ -3655,6 +3655,16 @@ fn late_line(frames: f64) {
         );
     }
     card_steps::log(frames);
+    let cut: Vec<u64> = crate::draw::TABLES_CUT.iter().map(|c| c.swap(0, Ordering::Relaxed)).collect();
+    if cut.iter().any(|&n| n > 0) {
+        tracing::info!(
+            "descriptor tables with constants at cuts of lists, per frame: {:.1} dropped, made afresh if a later part \
+             reads them (VICTORY_CUT_TABLES), {:.1} kept, {:.1} draws of a later part that read a kept one",
+            cut[0] as f64 / frames,
+            cut[1] as f64 / frames,
+            cut[2] as f64 / frames,
+        );
+    }
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
     log_blame(frames);

@@ -1158,11 +1158,13 @@ impl State {
     /// none); root arguments, vertex and index buffers are set by every
     /// draw anyway. The dynamic descriptor slots and the tables made in
     /// them stay: the parts before the cut have not run yet, and they are
-    /// given back when the title's list is reset.
+    /// given back when the title's list is reset. With [`cut_tables`] the
+    /// tables that hold a constant buffer are not used again by later parts.
     /// shortcut: the render target views are made again from the handles'
     /// descriptors as they are now, not as they were when the title set
     /// the targets (a descriptor rewritten in between names another view).
     pub(crate) fn replay(&mut self, list: &HostList) {
+        cut(&mut self.fresh_tables, cut_tables());
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
@@ -3375,6 +3377,9 @@ impl State {
             // Who reads of it, and as what, as far as [`readable`] goes by it.
             let reader = (used.as_ptr() as usize, used.len(), STORES.get(), TESTED_DEPTH.get().0);
             if let Some(known) = self.fresh_tables.get_mut(&key) {
+                if known.earlier {
+                    TABLES_CUT[2].fetch_add(1, Ordering::Relaxed);
+                }
                 let first = known.first;
                 // This reader had it brought up to date, and nothing in the
                 // list changed since: nothing to do again.
@@ -3431,7 +3436,8 @@ impl State {
                 made.push((slot, u32::MAX));
                 continue;
             };
-            self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
+            self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new(), constants: false, earlier: false });
+            let mut constants = false;
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of
@@ -3507,6 +3513,7 @@ impl State {
                         let slot = (std::ptr::from_ref(heap) as usize, index);
                         list.defer_constants(to, address as *const u8, size as usize, slot);
                         host.constant_at(index, &buffer, gpu, size);
+                        constants = true;
                     }
                     Some(view) => {
                         match halved(self, slot, k * 8) {
@@ -3540,6 +3547,9 @@ impl State {
                         }
                     }
                 }
+            }
+            if constants && let Some(t) = self.fresh_tables.get_mut(&key) {
+                t.constants = true;
             }
             made.push((slot, first * 32));
         }
@@ -4099,6 +4109,26 @@ fn compute_word(p: &HostPipeline, kind: u32) -> Option<(u32, u32)> {
 }
 
 #[cfg(test)]
+mod cut_tests {
+    use super::*;
+
+    /// At a cut only the tables with constants go, or are marked as an
+    /// earlier part's when kept.
+    #[test]
+    fn tables_with_constants_are_not_used_across_a_cut() {
+        let table = |constants| FreshTable { first: 0, epoch: 0, ready: Vec::new(), constants, earlier: false };
+        let mut tables: std::collections::HashMap<u32, FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>> =
+            Default::default();
+        tables.insert(1, table(true));
+        tables.insert(2, table(false));
+        cut(&mut tables, false);
+        assert!(tables[&1].earlier && !tables[&2].earlier);
+        cut(&mut tables, true);
+        assert_eq!(tables.keys().copied().collect::<Vec<_>>(), [2]);
+    }
+}
+
+#[cfg(test)]
 mod thread_tests {
     use super::*;
 
@@ -4239,6 +4269,50 @@ struct FreshTable {
     /// tested depth target.
     epoch: u64,
     ready: Vec<((usize, usize, bool, usize), bool)>,
+    /// It holds a constant buffer, filled at its host list's submission.
+    constants: bool,
+    /// That host list is an earlier part of a list cut at a wait.
+    earlier: bool,
+}
+
+/// Whether the tables of a list that hold constant buffers are made afresh in
+/// each part when the list is cut at a wait (`VICTORY_CUT_TABLES`; on by
+/// default with `VICTORY_CARD_STEPS`, else off; `0`/`1` to choose).
+///
+/// Such a table's constants are copied at the submission of the host list
+/// that made it, and a later part's draws that read the same table read that
+/// copy (the constants the title gave by the time the earlier part was
+/// submitted). With `VICTORY_CARD_STEPS` the slot shows a buffer of the
+/// earlier part's submission, which goes to other submissions once that one
+/// landed: a later part submitted after that (parts are held at their waits)
+/// reads another submission's bytes. Without it the slot shows the earlier
+/// host list's scratch memory, which is given out again once that list is
+/// reset. Costs dynamic slots: each part makes its own tables.
+fn cut_tables() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_CUT_TABLES").ok().as_deref() {
+        Some("1") => true,
+        Some("0") => false,
+        _ => std::env::var("VICTORY_CARD_STEPS").is_ok_and(|v| v == "1" || v == "2"),
+    })
+}
+
+/// Since the last frame-rate line: tables with constants dropped at a cut,
+/// kept across one (`VICTORY_CUT_TABLES=0`), and draws of a later part that
+/// read a kept one.
+pub(crate) static TABLES_CUT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// At a cut of the list ([`cut_tables`]): the tables with constants are
+/// dropped (`drop`), or kept and marked as an earlier part's.
+fn cut<K>(tables: &mut std::collections::HashMap<K, FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>, drop: bool) {
+    tables.retain(|_, t| {
+        if !t.constants {
+            return true;
+        }
+        TABLES_CUT[usize::from(!drop)].fetch_add(1, Ordering::Relaxed);
+        t.earlier = true;
+        !drop
+    });
 }
 
 /// Whether a table a list reads again, with nothing changed in the list
