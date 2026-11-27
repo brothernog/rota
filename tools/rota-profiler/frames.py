@@ -29,7 +29,7 @@ COUNTERS = [
     'guard_waits', 'guard_wait_ms', 'guard_faults', 'page_faults', 'process_cpu_ms',
     'frame_wait_title_ms', 'frame_wait_fence_ms', 'frame_wait_timer_ms', 'frame_wait_other_ms',
     'ds_pending_ms', 'unknown_ds_pending_ms',
-    'list_lock_ms', 'page_reads', 'pages_input',
+    'list_lock_ms', 'page_reads', 'pages_input', 'shadows_live', 'shadow_mb',
     'up_wc_bytes', 'up_other_bytes', 'back_compared_wc_bytes', 'back_compared_other_bytes', 'back_wc_bytes', 'back_other_bytes',
 ]
 SLOW, FAST, AROUND, LEAST_MS = 1.5, 0.67, 5.0, 40.0

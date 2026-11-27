@@ -13,6 +13,8 @@ It has two parts:
 $env:VICTORY_FRAME_LOG = 'local\logs\frames.csv'   # then run the title as usual (diagnostics build)
 ```
 
+Add `VICTORY_FRAME_LOG_MORE=1` for the columns that cost more to gather: copies by write-combined memory (`up_*`, `back_*`), list calls by site (`list_lock_ms`, `list_top*`), and memory (`working_set_mb`, `private_mb`, `available_mb`, `page_reads`, `pages_input`). Without it they stay empty (0 for the counts) and nothing of theirs runs.
+
 Write the CSV under `local/logs` (ignored by git). It holds numbers only: no names, no paths, no shader names.
 
 `t_s` uses the same clock as the overlay CSV's `t_s` and the overlay's "Run time" row: seconds since the overlay started. A drop seen live at "t 187 s" is the line with `t_s` near 187. The column is empty until the overlay has started.
@@ -57,7 +59,7 @@ All of these are summed over all threads for the frame, so they can exceed its w
 - `up_wc_bytes`, `up_other_bytes`: bytes copied from title memory up to the card's copies. `back_compared_wc_bytes`, `back_compared_other_bytes`: bytes of the copy-back compared after a submission. `back_wc_bytes`, `back_other_bytes`: bytes put back into title memory. Each pair is split by whether the title allocated that memory write-combined (protection bit 0x400 in `XMemVirtualAlloc`). Memory the title writes and does not read could skip the copy-back. A partial copy of a range is split in proportion to the range's write-combined bytes. Texture uploads are not in these columns.
 - `frame_wait_title_ms`, `frame_wait_fence_ms`, `frame_wait_timer_ms`, `frame_wait_other_ms`: the presenting thread's own waits, by what ended them. *Title*: a thread of the title's set, released or woke the object (through the functions the frame log wraps). *Fence*: one of our fences set the event. *Timer*: a sleep. *Other*: a time-out, or a waker we do not see (our own code setting an event directly, a kernel object). A wait on several objects is matched by its first object only.
 - `process_cpu_ms`, `page_faults`, `title_cpu_ms` (the presenting thread's processor time).
-- `working_set_mb`, `private_mb` (the process), `available_mb` (the system's free physical memory), gauges at the frame's end. `page_reads`, `pages_input`: the system's reads from disk for page faults in the frame, and the pages they brought in (all processes, from PDH). With `page_faults` they tell soft faults from faults that read the disk.
+- `working_set_mb`, `private_mb` (the process), `available_mb` (the system's free physical memory), gauges at the frame's end. `page_reads`, `pages_input`: the system's reads from disk for page faults in the frame, and the pages they brought in (all processes, from PDH). With `page_faults` they tell soft faults from faults that read the disk. `shadows_live`, `shadow_mb`: host copies of title buffers alive and the MB of title memory they copy (gauges; copies in place are not counted).
 - `menu_bits`: the switches menu's state at the line, a bit per switch (`VICTORY_MENU=1`; empty without the menu). `frames.py` sums up the frames of each state.
 - `list_lock_ms`: list calls waiting for their list's state. `list_top{1,2,3}_line`, `_ms`, `_calls`: the three list call sites that took the most time in the frame, each named by its line in `crates/victory-gpu/src/list.rs` (one per method), with their ms and calls.
 - `ticks`, `tick_max_ms`: the looking thread's looks in the frame and its longest gap. A long gap means the looker was starved and the frame's split is coarse.

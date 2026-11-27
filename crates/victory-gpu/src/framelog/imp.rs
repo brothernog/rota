@@ -13,6 +13,15 @@ pub fn on() -> bool {
     *ON.get_or_init(|| path().is_some())
 }
 
+/// `VICTORY_FRAME_LOG_MORE=1` (with the frame log): also the columns that
+/// cost more to gather — copies by write-combined memory, list calls by
+/// site, the process's and the system's memory. Without it those columns
+/// stay empty and nothing of theirs runs.
+pub(crate) fn more() -> bool {
+    static MORE: OnceLock<bool> = OnceLock::new();
+    *MORE.get_or_init(|| on() && std::env::var_os("VICTORY_FRAME_LOG_MORE").is_some_and(|v| v == "1"))
+}
+
 fn path() -> Option<std::path::PathBuf> {
     std::env::var_os("VICTORY_FRAME_LOG").filter(|v| !v.is_empty()).map(Into::into)
 }
@@ -455,7 +464,7 @@ fn cut(map: &mut std::collections::BTreeMap<usize, usize>, at: usize, end: usize
 
 /// The title allocated `[at, at + len)`, write-combined or not.
 pub fn title_memory_kind(at: usize, len: usize, write_combined: bool) {
-    if !on() || len == 0 {
+    if !more() || len == 0 {
         return;
     }
     let mut map = WC.write().unwrap_or_else(|e| e.into_inner());
@@ -506,7 +515,7 @@ fn wc_of(at: usize, end: usize) -> usize {
 
 /// The title freed `[at, at + len)` (`len` 0: the allocation at `at`).
 pub(crate) fn title_memory_gone(at: usize, len: usize) {
-    if !on() {
+    if !more() {
         return;
     }
     let mut map = WC.write().unwrap_or_else(|e| e.into_inner());
@@ -537,7 +546,7 @@ pub(crate) enum Copied {
 /// split in proportion to the range's write-combined bytes, which is exact
 /// while a range lies in one allocation, as a buffer's does.
 pub(crate) fn copied(way: Copied, at: usize, len: usize, bytes: u64) {
-    if !on() || len == 0 || bytes == 0 {
+    if !more() || len == 0 || bytes == 0 {
         return;
     }
     let wc = wc_of(at, at.saturating_add(len)) as u64;
@@ -566,7 +575,7 @@ static SITE_NS: [[AtomicU64; SITES]; BANKS] = [const { [const { AtomicU64::new(0
 /// A list call from `line` of `list.rs` took `ns`, `lock_ns` of them
 /// waiting for the list's state.
 pub(crate) fn list_call(line: u32, ns: u64, lock_ns: u64) {
-    if !on() {
+    if !more() {
         return;
     }
     count(K::ListLockNs, lock_ns);
@@ -968,7 +977,7 @@ pub(crate) fn header() -> String {
     h.push_str(
         ",pipelines_made,pipelines_loaded,pipelines_making,textures_waiting,process_cpu_ms,page_faults,ticks,tick_max_ms",
     );
-    h.push_str(",working_set_mb,private_mb,available_mb,page_reads,pages_input");
+    h.push_str(",working_set_mb,private_mb,available_mb,page_reads,pages_input,shadows_live,shadow_mb");
     for i in 1..=TOP {
         let _ = std::fmt::Write::write_fmt(&mut h, format_args!(",list_top{i}_line,list_top{i}_ms,list_top{i}_calls"));
     }
@@ -1098,15 +1107,21 @@ impl Looker {
         );
         self.pipelines = (made, loaded);
         (self.cpu, self.faults) = (cpu, faults);
-        let (working, private, available) = memory_mb();
-        let reads = self.page_reads.as_ref().map_or((0, 0), PageReads::read);
-        let _ = write!(
-            row,
-            ",{working},{private},{available},{},{}",
-            reads.0 - self.reads.0.min(reads.0),
-            reads.1 - self.reads.1.min(reads.1)
-        );
-        self.reads = reads;
+        if more() {
+            let (working, private, available) = memory_mb();
+            let reads = self.page_reads.as_ref().map_or((0, 0), PageReads::read);
+            let _ = write!(
+                row,
+                ",{working},{private},{available},{},{}",
+                reads.0 - self.reads.0.min(reads.0),
+                reads.1 - self.reads.1.min(reads.1)
+            );
+            self.reads = reads;
+        } else {
+            row.push_str(",,,,,");
+        }
+        let (shadows, bytes) = crate::shadow::live();
+        let _ = write!(row, ",{shadows},{}", bytes >> 20);
         let mut sites: Vec<(u64, u64, u32)> = (0..SITES)
             .filter_map(|i| {
                 let line = SITE_LINE[i].load(Relaxed);
@@ -1200,7 +1215,7 @@ fn look(file: std::fs::File) {
         faults: crate::copystat::page_faults(),
         thread: (0, 0, 0),
         cycles_per_us: cycles_per_us(),
-        page_reads: PageReads::new(),
+        page_reads: if more() { PageReads::new() } else { None },
         reads: (0, 0),
         sites: [(0, 0); SITES],
     };
@@ -1356,7 +1371,7 @@ mod tests {
     #[test]
     fn the_header_names_every_column() {
         let h = header();
-        assert_eq!(h.split(',').count(), 4 + BUCKETS.len() + 5 + NAMES.len() + 8 + 5 + 3 * TOP + 1);
+        assert_eq!(h.split(',').count(), 4 + BUCKETS.len() + 5 + NAMES.len() + 8 + 7 + 3 * TOP + 1);
         assert!(h.contains(",xmem_title_ms,") && h.contains(",unexplained,") && !h.contains("_ns"));
     }
 }
