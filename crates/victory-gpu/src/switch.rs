@@ -25,14 +25,9 @@ macro_rules! toggled {
     ($name:literal) => {{
         #[cfg(feature = "diagnostics")]
         {
-            static BIT: std::sync::OnceLock<Result<bool, u32>> = std::sync::OnceLock::new();
-            match BIT.get_or_init(|| match $crate::ab::bit($name) {
-                Some(bit) => Err(bit),
-                None => Ok(std::env::var_os($name).is_none_or(|v| v != "0")),
-            }) {
-                Ok(on) => *on,
-                Err(bit) => $crate::ab::on(*bit),
-            }
+            static BIT: std::sync::OnceLock<(Option<u32>, bool)> = std::sync::OnceLock::new();
+            let (bit, own) = *BIT.get_or_init(|| ($crate::ab::bit($name), std::env::var_os($name).is_none_or(|v| v != "0")));
+            bit.and_then($crate::ab::taken).unwrap_or(own)
         }
         #[cfg(not(feature = "diagnostics"))]
         {

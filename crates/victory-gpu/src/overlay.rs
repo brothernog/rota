@@ -31,6 +31,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::pixels::{Bitmap, short_cpu, short_gpu};
 
+#[cfg(all(windows, feature = "diagnostics"))]
+mod menu;
+
 /// One tick of the present path's meter, every value per frame over about a second.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Frame {
@@ -101,6 +104,8 @@ struct Stats {
     vram: Option<[f64; 4]>,
     cpu_name: String,
     gpu_name: String,
+    /// The switches menu's switches on now, a bit each (`crate::ab::menu_bits`; none without the menu).
+    menu_bits: Option<u32>,
 }
 
 /// Starts the overlay thread for the game window `hwnd` (the first call only).
@@ -253,19 +258,23 @@ fn sample(cpu: &mut Cpu, gpu: Option<&Gpu3d>, adapter: Option<&IDXGIAdapter3>, n
         vram,
         cpu_name: names.0.clone(),
         gpu_name: names.1.clone(),
+        #[cfg(all(windows, feature = "diagnostics"))]
+        menu_bits: crate::ab::menu().then(crate::ab::menu_bits),
+        #[cfg(not(all(windows, feature = "diagnostics")))]
+        menu_bits: None,
     }
 }
 
 const CSV_HEADER: &str = "t_s,fps,ms,preparing_ms,copy_ms,copy_mb,texture_ms,texture_mb,gpu_wait_ms,back_ms,back_mb,\
 draws,dropped,pipelines_making,textures_waiting,textures_up_mb,cpu_pct,gpu_pct,ram_process_gb,commit_gb,\
-ram_used_gb,ram_total_gb,vram_budget_gb,vram_used_gb,shared_budget_gb,shared_used_gb";
+ram_used_gb,ram_total_gb,vram_budget_gb,vram_used_gb,shared_budget_gb,shared_used_gb,menu_bits";
 
 /// One CSV row: numbers only (empty where the system gave none).
 fn csv_row(t: f64, s: &Stats) -> String {
     let f = &s.frame;
     let v = s.vram.map_or([String::new(), String::new(), String::new(), String::new()], |v| v.map(|x| format!("{x:.3}")));
     format!(
-        "{t:.1},{:.2},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.2},{:.0},{:.0},{},{},{},{:.0},{},{:.3},{:.3},{:.3},{:.3},{},{},{},{}",
+        "{t:.1},{:.2},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.2},{:.0},{:.0},{},{},{},{:.0},{},{:.3},{:.3},{:.3},{:.3},{},{},{},{},{}",
         f.fps,
         f.ms,
         f.preparing,
@@ -290,7 +299,8 @@ fn csv_row(t: f64, s: &Stats) -> String {
         v[0],
         v[1],
         v[2],
-        v[3]
+        v[3],
+        s.menu_bits.map_or(String::new(), |b| b.to_string())
     )
 }
 
@@ -655,6 +665,8 @@ fn run(game: HWND, adapter: Option<IDXGIAdapter3>) {
         let mut cpu = Cpu(0, 0);
         cpu.percent();
         let gpu = Gpu3d::new();
+        #[cfg(all(windows, feature = "diagnostics"))]
+        let menu = menu::Menu::new(instance);
         let mut f10 = false;
         SetTimer(window, REFRESH, 500, None);
         SetTimer(window, KEYS, 40, None);
@@ -672,14 +684,18 @@ fn run(game: HWND, adapter: Option<IDXGIAdapter3>) {
             }
             let mut client = std::mem::zeroed::<RECT>();
             let mut origin = POINT { x: 0, y: 0 };
-            let show = VISIBLE.load(Ordering::Relaxed)
-                && IsWindow(game) != 0
+            let game_shown = IsWindow(game) != 0
                 && IsIconic(game) == 0
                 && IsWindowVisible(game) != 0
                 && ours_in_front()
                 && GetClientRect(game, &mut client) != 0
                 && ClientToScreen(game, &mut origin) != 0;
+            let show = VISIBLE.load(Ordering::Relaxed) && game_shown;
             let frame_h = client.bottom.max(1) as usize;
+            #[cfg(all(windows, feature = "diagnostics"))]
+            if let Some(m) = menu.as_ref() {
+                m.refresh(game_shown, origin, client.right, frame_h);
+            }
             let Some(bm) = show.then(|| render(&stats, frame_h)).flatten() else {
                 ShowWindow(window, SW_HIDE);
                 return;
@@ -698,11 +714,16 @@ fn run(game: HWND, adapter: Option<IDXGIAdapter3>) {
                 } else {
                     // Edge-triggered: acts on the press, not the hold.
                     let d10 = GetAsyncKeyState(VK_F10) < 0;
-                    if ours_in_front() && d10 && !f10 {
+                    let again = ours_in_front() && d10 && !f10;
+                    if again {
                         VISIBLE.fetch_xor(true, Ordering::Relaxed);
-                        refresh(&mut cpu);
                     }
                     f10 = d10;
+                    #[cfg(all(windows, feature = "diagnostics"))]
+                    let again = again | menu.as_ref().is_some_and(|m| m.keys(ours_in_front()));
+                    if again {
+                        refresh(&mut cpu);
+                    }
                 }
                 continue;
             }

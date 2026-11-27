@@ -55,7 +55,7 @@ macro_rules! asked_for {
         match *asked {
             Ok(on) => on,
             #[cfg(feature = "diagnostics")]
-            Err(bit) => crate::ab::on(bit),
+            Err(bit) => crate::ab::taken(bit).unwrap_or(false),
             #[cfg(not(feature = "diagnostics"))]
             Err(_) => false,
         }
