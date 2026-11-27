@@ -1998,8 +1998,17 @@ static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
 /// walked the piece before, 4,096 steps; the passes took 24.8 ms of a frame's
 /// 82 on the card (capture replay1, 405 of them), most of it waiting for
 /// those steps.
+///
+/// With `CARD_RING` defined (`ring`, `VICTORY_CARD_RING`): mode 3 is mode 2,
+/// and a flagged piece is also copied whole (as hashed) into a slot of the
+/// ring, whose number goes to the ring's index at the piece's dword.
+/// Without it the source is as it was.
 pub(crate) const CARD_COMPARE: &str = r#"
+#ifdef CARD_RING
+#define RS "RootConstants(num32BitConstants=8, b0), SRV(t0), UAV(u0), UAV(u1), UAV(u2), UAV(u3)"
+#else
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
+#endif
 cbuffer Span : register(b0) {
     uint first;    // the first piece
     uint skew;     // where the copy starts in its piece 0
@@ -2007,12 +2016,24 @@ cbuffer Span : register(b0) {
     uint pieces;
     uint out_at;   // the first piece's dword in `differs`, in bytes
     uint compare;  // 0: the hashes are stored; else compared with those stored (2: and then stored)
+#ifdef CARD_RING
+    uint tail;     // the first slot number not landed yet (31 bits)
+    uint slots;    // the ring's slots, a power of two
+#endif
 };
 ByteAddressBuffer now : register(t0);
 // 16 bytes per piece of the copy: the hash of its bytes when they were
 // last sent up (or hashed whole, the first time).
 RWByteAddressBuffer hashes : register(u0);
 RWByteAddressBuffer differs : register(u1);
+#ifdef CARD_RING
+// 1 MiB of index (a dword per piece, as `differs`: the slot number, the top
+// bit set where it did not fit), then the slots.
+RWByteAddressBuffer ring : register(u2);
+// The next slot number.
+RWByteAddressBuffer counter : register(u3);
+groupshared uint dest;
+#endif
 groupshared uint4 parts[64];
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
@@ -2060,7 +2081,13 @@ void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
     }
     parts[thread] = h;
     GroupMemoryBarrierWithGroupSync();
+#ifdef CARD_RING
+    // (No return: the copy below waits for this thread.)
+    if (thread == 0u) {
+    dest = 0xFFFFFFFFu;
+#else
     if (thread != 0u) return;
+#endif
     h = parts[0];
     [loop]
     for (uint i = 1u; i < 64u; ++i) {
@@ -2073,12 +2100,43 @@ void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
         differs.Store(out_at + id.x * 4u, (folded << 1u) | (any(h != hashes.Load4(piece * 16u)) ? 1u : 0u));
         // With the copy-back on its own thread: the next compare of the
         // piece finds what is written from here on.
+#ifdef CARD_RING
+        if (compare == 3u) {
+            if (any(h != hashes.Load4(piece * 16u))) {
+                uint s;
+                counter.InterlockedAdd(0, 1u, s);
+                s &= 0x7FFFFFFFu;
+                bool fits = ((s - tail) & 0x7FFFFFFFu) < slots;
+                ring.Store(out_at + id.x * 4u, fits ? s : (s | 0x80000000u));
+                if (fits) dest = 1048576u + (s & (slots - 1u)) * 65600u;
+            }
+            hashes.Store4(piece * 16u, h);
+        }
+#endif
         if (compare == 2u) hashes.Store4(piece * 16u, h);
     } else {
         hashes.Store4(piece * 16u, h);
     }
+#ifdef CARD_RING
+    }
+    GroupMemoryBarrierWithGroupSync();
+    uint to = dest;
+    if (to != 0xFFFFFFFFu) {
+        // The bytes just hashed, by the same threads in the same steps.
+        [loop]
+        for (at = lo + thread * 16u; at < hi; at += 1024u) {
+            ring.Store4(to + (at - lo), now.Load4(at));
+        }
+    }
+#endif
 }
 "#;
+
+/// [`CARD_COMPARE`] with the ring ([`ring`]).
+#[cfg(test)]
+pub(crate) fn card_compare_ring() -> String {
+    format!("#define CARD_RING 1\n{CARD_COMPARE}")
+}
 
 /// The hash [`CARD_COMPARE`] gives of a piece with its flag.
 #[cfg(test)]
