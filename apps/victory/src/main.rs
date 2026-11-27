@@ -34,6 +34,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// List DXGI adapters and their zero-based indices for VICTORY_ADAPTER.
+    #[cfg(windows)]
+    Adapters,
     /// Summarise one PE image: headers, sections, imports, TLS, build id.
     Inspect {
         file: PathBuf,
@@ -180,6 +183,8 @@ fn main() -> Result<()> {
     }
     let cli = Cli::parse();
     match cli.command {
+        #[cfg(windows)]
+        Command::Adapters => show_adapters(),
         Command::Inspect {
             file,
             imports,
@@ -237,6 +242,27 @@ fn main() -> Result<()> {
     }
 }
 
+#[cfg(windows)]
+fn show_adapters() -> Result<()> {
+    let adapters = victory_core::adapter::list()?;
+    if adapters.is_empty() {
+        println!("No DXGI adapters found.");
+    }
+    for adapter in adapters {
+        let kind = if adapter.software { "software" } else { "hardware" };
+        let support = if adapter.supports_d3d12 {
+            "supported"
+        } else {
+            "unavailable"
+        };
+        println!(
+            "{}  {} ({kind}, {} MiB dedicated, D3D12 feature level 12_0 {support})",
+            adapter.index, adapter.name, adapter.dedicated_mib,
+        );
+    }
+    Ok(())
+}
+
 fn show_config() -> Result<()> {
     let cfg = victory_core::Config::load()?;
     let status = |p: &Option<PathBuf>| match p {
@@ -253,6 +279,11 @@ fn show_config() -> Result<()> {
     println!("game_dir    : {}", status(&cfg.game_dir));
     println!("cache_dir   : {}", cfg.cache_dir.display());
     println!("data_dir    : {}", cfg.data_dir.display());
+    println!(
+        "gpu.adapter : {}",
+        cfg.adapter
+            .map_or_else(|| "automatic".to_owned(), |index| index.to_string())
+    );
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }

@@ -42,6 +42,12 @@ buffers, until it is done.
 
     victory replay <folder> [--loops 5] [--timing detailed] [experiments]
 
+To replay on a specific GPU, use the index from `victory adapters` with
+`VICTORY_ADAPTER` or `[gpu].adapter` in `victory.toml`. With automatic
+selection, replay looks for an adapter matching the capture's vendor and
+device IDs, then uses the system default if it finds none. See
+[Choose a GPU](../README.md#choose-a-gpu).
+
 `<folder>` is the one given as `VICTORY_RECORD` (its last capture) or a
 capture. Each loop puts back what the one before changed and sends the frame
 without waiting between submissions. Reported, from timestamps on the card:

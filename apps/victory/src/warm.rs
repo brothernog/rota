@@ -27,6 +27,7 @@ fn folder() -> Result<PathBuf> {
 }
 
 pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, these: Option<String>) -> Result<()> {
+    victory_core::adapter::selected()?;
     let dir = folder()?;
     if let Some(these) = these {
         return make(&dir, &these);
