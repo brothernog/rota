@@ -5538,7 +5538,7 @@ impl Host {
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
         // Or the reads are done on the card, behind the flights.
-        let own = if late { self.card_steps(runs) } else { None };
+        let mut own = if late { self.card_steps(runs) } else { None };
         #[cfg(feature = "diagnostics")]
         ahead.part(12);
         stage.next("submit: waiting for flights it reads from");
@@ -5556,6 +5556,13 @@ impl Host {
             } else {
                 self.settle(&mut submitted, why);
             }
+        } else if own.is_some() && card_steps::check() == 2 {
+            // The check's second level: the steps are done on the card
+            // behind the wait they took off all the same.
+            relay_wait(WHY_READ, |line| blocked_by(&line.written, runs, false).is_none());
+        }
+        if let Some(own) = &mut own {
+            own.then();
         }
         #[cfg(feature = "diagnostics")]
         ahead.part(13);

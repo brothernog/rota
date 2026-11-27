@@ -2705,6 +2705,13 @@ impl HostHeap {
     }
 
     /// Slot `index` now views `resource` (or nothing of the host's).
+    /// What slot `index` holds on to (by address; with `VICTORY_SLOT_HOLDS`).
+    pub(crate) fn shows(&self, index: u32) -> Option<usize> {
+        use windows::core::Interface;
+        let slot = self.kept.get(index as usize)?.lock().unwrap_or_else(|e| e.into_inner());
+        slot.as_ref().map(|r| r.as_raw() as usize)
+    }
+
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
         let Some(slot) = self.kept.get(index as usize) else {
             return;

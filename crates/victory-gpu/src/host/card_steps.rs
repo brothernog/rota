@@ -595,10 +595,12 @@ fn record(
     }
 }
 
-/// The list in front of a submission's, and its buffer ([`BETWEEN`] bytes).
+/// The list in front of a submission's, and its buffer ([`BETWEEN`] bytes);
+/// with [`check`] a read-back buffer as long.
 struct Own {
     list: HostList,
     between: ID3D12Resource,
+    back: Option<ID3D12Resource>,
 }
 
 // SAFETY: D3D12 objects are free-threaded, and the list is touched by one
@@ -620,6 +622,7 @@ pub(super) struct Taken {
     own: Own,
     steps: std::collections::HashSet<(usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
     copied: Vec<(Arc<Shadow>, usize, usize)>,
+    check: Option<Check>,
 }
 
 impl Taken {
@@ -641,8 +644,26 @@ impl Taken {
         })
     }
 
+    /// Title memory where the steps read, as the CPU reads it now: called
+    /// where the CPU's wait would have ended ([`check`]).
+    pub(super) fn then(&mut self) {
+        if let Some(check) = &mut self.check {
+            check.then.clear();
+            for l in &check.of {
+                let at = check.then.len();
+                check.then.resize(at + l.len, 0);
+                read_there(l.src as *const u8, &mut check.then[at..]);
+            }
+        }
+    }
+
     /// The submission has run and landed: the list and its buffer are free.
-    pub(super) fn landed(self) {
+    pub(super) fn landed(mut self) {
+        if let Some(check) = self.check.take()
+            && let Some(back) = &self.own.back
+        {
+            looked(&check, back, &self.own.between);
+        }
         // The host copies its steps held go; its commands stay until the
         // next use resets it.
         drop(std::mem::take(&mut *self.own.list.deferred()));
@@ -767,7 +788,11 @@ impl Host {
                 _ => match fill_to(runs, steps[i]) {
                     Some(FillTo::Slot(heap, index)) => To::Slot(heap, index),
                     Some(FillTo::Buffer(buffer)) => To::Buffer(buffer),
-                    None => continue,
+                    None => {
+                        // Left out by the CPU and done by nobody.
+                        LOST.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                 },
             };
             ops.push(Op {
@@ -828,6 +853,29 @@ impl Host {
             }
             record(level == 0, &own.list.list, &own.between, &reads, &writes);
         }
+        let check = own.back.as_ref().filter(|_| check() > 0).map(|back| {
+            // SAFETY: an open list; our buffer is left readable as a copy's
+            // source, a read-back buffer is always a copy's destination.
+            unsafe { own.list.list.CopyBufferRegion(back, 0, &own.between, 0, end) };
+            Check {
+                of: ops
+                    .iter()
+                    .map(|op| Looked {
+                        src: op.from.1,
+                        len: op.len,
+                        at: op.at,
+                        copy: matches!(op.to, To::Copy(..)),
+                        slot: match op.to {
+                            To::Slot(heap, index) => Some((heap, index)),
+                            _ => None,
+                        },
+                        copy_of: op.from.0.span(),
+                    })
+                    .collect(),
+                then: Vec::new(),
+                end,
+            }
+        });
         own.list.close();
         // SAFETY: a live buffer.
         let gpu = unsafe { own.between.GetGPUVirtualAddress() };
@@ -857,6 +905,7 @@ impl Host {
             own,
             steps: chosen.iter().map(|&(i, _)| steps[i]).collect(),
             copied,
+            check,
         }))
     }
 
@@ -870,7 +919,166 @@ impl Host {
         let between = self.uav_buffer(BETWEEN)?;
         name(&between, || "copies of title memory on the card".into());
         let list = self.new_list().ok()?;
-        Some(Own { list, between })
+        let back = if check() > 0 { self.read_back_buffer(BETWEEN) } else { None };
+        Some(Own { list, between, back })
+    }
+}
+
+/// `VICTORY_STEP_CHECK` (off by default): whether the bytes each step done
+/// on the card used are those the CPU would have read after its wait. Our
+/// buffer is read back behind the steps; at the landing it is compared with
+/// title memory as it was where the wait would have ended (`then`) and as it
+/// is now, after the flights' copy-back (`now`), see [`verdict`]. `1`: the
+/// steps run as without the check, `then` taken at the submission; `2`: the
+/// old wait is taken all the same, `then` behind it. If the picture is
+/// spoilt with `2` too, the steps' bytes or slots are; if not, the steps'
+/// timing (the title's code running ahead of the landings) or the title's
+/// bytes put in under the flights' writes, which `2` keeps out. Costs a
+/// read-back and two reads of title memory per step: not for timed runs.
+pub(super) fn check() -> u8 {
+    static CHECK: OnceLock<u8> = OnceLock::new();
+    *CHECK.get_or_init(|| match std::env::var("VICTORY_STEP_CHECK").ok().as_deref() {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => 0,
+    })
+}
+
+/// A step looked at by [`check`]: title address, bytes, place in our buffer,
+/// whether a copy, the slot a fill shows, the host copy read (start, length).
+struct Looked {
+    src: usize,
+    len: usize,
+    at: u64,
+    copy: bool,
+    slot: Option<(usize, u32)>,
+    copy_of: (u64, u64),
+}
+
+/// What [`check`] keeps of a submission until it lands: its steps, title
+/// memory at them where the wait would have ended (one after the other), and
+/// the bytes of our buffer read back.
+struct Check {
+    of: Vec<Looked>,
+    then: Vec<u8>,
+    end: u64,
+}
+
+/// How the bytes a step used on the card (`card`) stand to title memory where
+/// the CPU's wait would have ended (`then`) and after the landing (`now`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Verdict {
+    /// The card used what the CPU would have read.
+    Alike,
+    /// The card used what a flight ahead of it wrote, which the CPU's wait
+    /// would have brought too (the bytes changed only by the landing).
+    Landed,
+    /// Nobody changed the bytes, and the card used others: a host copy that
+    /// was not up to date, or a wrong place read.
+    Wrong,
+    /// All three differ: the title wrote them meanwhile, or a later flight.
+    Unsure,
+}
+
+fn verdict(then: &[u8], now: &[u8], card: &[u8]) -> Verdict {
+    if card == then {
+        Verdict::Alike
+    } else if then == now {
+        Verdict::Wrong
+    } else if card == now {
+        Verdict::Landed
+    } else {
+        Verdict::Unsure
+    }
+}
+
+/// Per kind of step (whether a copy, bytes, host copy read): steps per
+/// [`Verdict`], of the wrong ones those that read zeros, and where the last
+/// wrong one first differed.
+type Checked = std::collections::HashMap<(bool, usize, (u64, u64)), ([u64; 4], u64, usize)>;
+static CHECKED: Mutex<Option<Checked>> = Mutex::new(None);
+
+/// Since the last frame-rate line: fills whose slot showed another buffer
+/// than ours at the landing, and chosen steps nobody did.
+static SLOTS_MOVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LOST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`check`] at a landing.
+fn looked(check: &Check, back: &ID3D12Resource, between: &ID3D12Resource) {
+    let end = check.end as usize;
+    if check.then.len() != check.of.iter().map(|l| l.len).sum::<usize>() {
+        return; // `then` was not taken
+    }
+    let mut data = std::ptr::null_mut();
+    // SAFETY: a read-back buffer of ours, which the landed submission wrote.
+    if unsafe { back.Map(0, Some(&D3D12_RANGE { Begin: 0, End: end }), Some(&mut data)) }.is_err() || data.is_null() {
+        return;
+    }
+    // SAFETY: mapped, `end` bytes at most `BETWEEN`.
+    let card = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), end) };
+    let mut checked = CHECKED.lock().unwrap_or_else(|e| e.into_inner());
+    let checked = checked.get_or_insert_with(Default::default);
+    let (mut from, mut now) = (0, Vec::new());
+    for l in &check.of {
+        let then = &check.then[from..from + l.len];
+        from += l.len;
+        now.resize(l.len, 0);
+        read_there(l.src as *const u8, &mut now);
+        let used = &card[l.at as usize..l.at as usize + l.len];
+        let v = verdict(then, &now, used);
+        let e = checked.entry((l.copy, l.len, l.copy_of)).or_default();
+        e.0[v as usize] += 1;
+        if v == Verdict::Wrong {
+            e.1 += u64::from(used.iter().all(|&b| b == 0));
+            e.2 = then.iter().zip(used).position(|(a, b)| a != b).unwrap_or(0);
+        }
+        if let Some((heap, index)) = l.slot
+            && crate::descriptor::slot_shows(heap, index).is_some_and(|r| r != between.as_raw() as usize)
+        {
+            SLOTS_MOVED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    // SAFETY: mapped above; nothing written.
+    unsafe { back.Unmap(0, Some(&D3D12_RANGE::default())) };
+}
+
+/// [`check`]'s part of the frame-rate line.
+fn log_check(frames: f64) {
+    let mut checked: Vec<_> =
+        CHECKED.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default().into_iter().collect();
+    let (mut all, mut zeros) = ([0u64; 4], 0);
+    for (_, (n, z, _)) in &checked {
+        (0..4).for_each(|i| all[i] += n[i]);
+        zeros += z;
+    }
+    let f = |n: u64| n as f64 / frames;
+    tracing::info!(
+        "steps done on the card checked against title memory, per frame (VICTORY_STEP_CHECK={}): {:.1} alike, {:.1} as a \
+         flight ahead left them, {:.1} wrong ({:.1} of them zeros), {:.1} unsure (changed since); {:.2} slots showing another \
+         buffer at the landing, {:.2} steps left undone",
+        check(),
+        f(all[0]),
+        f(all[1]),
+        f(all[2]),
+        f(zeros),
+        f(all[3]),
+        f(SLOTS_MOVED.swap(0, Ordering::Relaxed)),
+        f(LOST.swap(0, Ordering::Relaxed)),
+    );
+    checked.sort_unstable_by_key(|(_, (n, ..))| std::cmp::Reverse(n[2] + n[3]));
+    for ((copy, len, of), (n, zeros, off)) in checked.into_iter().take(5).filter(|(_, (n, ..))| n[2] + n[3] > 0) {
+        tracing::info!(
+            "checked, per frame: {} of {len:#x} bytes from the host copy of {:#x}+{:#x}: {:.1} alike, {:.1} as a flight left \
+             them, {:.1} wrong ({:.1} zeros, the last first off at {off:#x}), {:.1} unsure",
+            if copy { "copies" } else { "fills" },
+            of.0,
+            of.1,
+            f(n[0]),
+            f(n[1]),
+            f(n[2]),
+            f(zeros),
+            f(n[3]),
+        );
     }
 }
 
@@ -911,6 +1119,9 @@ pub(super) fn log(frames: f64) {
         d[2] / 1024.0,
         d[3],
     );
+    if check() > 0 {
+        log_check(frames);
+    }
     #[cfg(feature = "diagnostics")]
     {
         let noted = NOTED.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
@@ -1133,6 +1344,18 @@ mod tests {
         assert!(plan(&[copy(1000, 1050, 100, true)], 2, true, &mut None).is_err());
         assert!(plan(&[taken], 1, true, &mut None).is_err());
         assert!(plan(&[fill(1000, 4, true), copy(1000, 5000, 100, false)], 1, true, &mut None).is_err());
+    }
+
+    /// What the check calls the bytes a step used, against title memory at
+    /// the wait and at the landing.
+    #[test]
+    fn the_check_tells_wrong_bytes_from_landed_ones() {
+        let (a, b, c) = (&[1u8, 2][..], &[1u8, 3][..], &[0u8, 0][..]);
+        assert_eq!(verdict(a, a, a), Verdict::Alike);
+        assert_eq!(verdict(a, b, a), Verdict::Alike);
+        assert_eq!(verdict(a, b, b), Verdict::Landed);
+        assert_eq!(verdict(a, a, c), Verdict::Wrong);
+        assert_eq!(verdict(a, b, c), Verdict::Unsure);
     }
 
     #[test]
