@@ -10,6 +10,10 @@ pub(crate) const TUNED: &[(&str, &str)] = &[
     ("VICTORY_RT_MISS", "1"),
     // Copy-back on a thread of its own, beside the submitting thread.
     ("VICTORY_RELAY", "2"),
+    // Hash adjacent sent ranges in one card pass instead of one pass each.
+    ("VICTORY_CARD_REHASH_RUNS", "1"),
+    // Fetch shader-written card memory on the copy queue beside later draws.
+    ("VICTORY_RELAY_COPY", "1"),
     // `VICTORY_THIN=1` more than halves the frame rate on NVIDIA cards.
     ("VICTORY_THIN", "0"),
     // Records the pipelines runs use, for `warm --used`.
@@ -20,7 +24,7 @@ pub(crate) const TUNED: &[(&str, &str)] = &[
     ("VICTORY_MEMORY_MAP", "0"),
     // Steps done on the card instead of waiting for flights: about +40%,
     // with softer shadows (`VICTORY_CARD_STEPS=0` for the exact ones).
-    ("VICTORY_CARD_STEPS", "1"),
+    ("VICTORY_CARD_STEPS", "2"),
     // Small title buffers get a copy on the card too: about +33% more.
     ("VICTORY_CARD_ALL", "1"),
     ("VICTORY_DYNAMIC_SLOTS", "499999"),

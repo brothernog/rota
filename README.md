@@ -86,6 +86,14 @@ xychart-beta
 - **Measured defaults for 8 GB cards**, applied by `victory.exe` itself when you have not set
   them (see [Build and run](#build-and-run)); `VICTORY_TUNED=0` turns them all off. No texture
   budget cap (`VICTORY_TEXTURE_BUDGET_MB` unset).
+- The measured defaults also hash adjacent card-memory ranges in one pass
+  (`VICTORY_CARD_REHASH_RUNS=1`), fetch shader writes on the copy queue
+  (`VICTORY_RELAY_COPY=1`), and perform buffer steps on the card
+  (`VICTORY_CARD_STEPS=2`). On one RTX 3060 test run pair these raised the
+  median from about 10.4 to 14.1 FPS at the same scene and route. The card-step
+  mode uses approximate copies and can soften shadows. This is a short-run
+  result; it does not establish long-term stability or complete rendering
+  correctness. See [optimization trials](docs/optimization-trials.md).
 
 Inherited from the forks it starts from, and kept on:
 
