@@ -22,10 +22,10 @@
 mod imp;
 
 #[cfg(all(windows, feature = "diagnostics"))]
-pub use imp::{Xmem, XmemCall, dstorage, on, xmem};
+pub use imp::{Reading, Xmem, XmemCall, ds_pending, dstorage, on, reading, xmem};
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) use imp::{
-    K, Phase, State, count, enter, fence_event, phase, presented, presenting, relay, title_wait, waiting_guards,
+    BY_FENCE, BY_TITLE, K, Phase, State, count, enter, fence_event, phase, presented, presenting, relay, title_wait, waiting_guards, woke,
     waiting_pipeline,
 };
 
@@ -63,6 +63,22 @@ pub fn on() -> bool {
 pub fn xmem(_kind: Xmem, _pages: u64) -> XmemCall {
     XmemCall
 }
+
+/// A DirectStorage read, counted while it lives.
+#[cfg(not(all(windows, feature = "diagnostics")))]
+pub struct Reading;
+
+/// A DirectStorage read begins.
+#[cfg(not(all(windows, feature = "diagnostics")))]
+#[inline(always)]
+pub fn reading() -> Reading {
+    Reading
+}
+
+/// `n` DirectStorage reads are submitted and not done.
+#[cfg(not(all(windows, feature = "diagnostics")))]
+#[inline(always)]
+pub fn ds_pending(_n: u32) {}
 
 /// A DirectStorage read of `bytes` is done.
 #[cfg(not(all(windows, feature = "diagnostics")))]

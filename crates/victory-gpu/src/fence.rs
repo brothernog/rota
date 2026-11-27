@@ -62,6 +62,8 @@ pub(crate) extern "system" fn create(
 }
 
 fn set_event(event: usize) {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::framelog::woke(event as u64, crate::framelog::BY_FENCE);
     #[cfg(windows)]
     // SAFETY: the title passed an event handle.
     unsafe {

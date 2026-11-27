@@ -32,7 +32,7 @@ The bucket is chosen from the state of the thread that presents:
 | a submission, or the present, with the lock holder at a phase | `preparing`, `gpu_wait`, `copy_back` (while flights land: by what the landing thread does) |
 | a submission otherwise (waiting for the lock, the sweep) | `submit` |
 | the present otherwise / the title's frame wait | `present` / `pace` |
-| a wait of the title's | whatever of ours is going on anywhere, in the order submission, title map calls, queue map calls, pipeline waits, tracker locks; with nothing of ours, `title_wait` (`fence_wait` for an event one of our fences sets) |
+| a wait of the title's | whatever of ours is going on anywhere, in the order submission, title map calls, queue map calls, pipeline waits, tracker locks, list calls on other threads (`recording`), DirectStorage reads (`dstorage`); with nothing of ours, `title_wait` (`fence_wait` for an event one of our fences sets) |
 | the title's own code | its processor time (`QueryThreadCycleTime`) is `title_running`; the rest of the tick goes to what of ours is going on, else `unexplained` |
 
 So **`unexplained`** is time when the presenting thread was neither in code of ours, nor in one of the title's waits we wrap, nor running, while nothing of ours was going on anywhere. Examples: a wait through a function we do not wrap, a page fault, or a thread ready to run with no free core. `title_wait` and `fence_wait` say that the title waited, but not why, so `frames.py` counts them as **unknown** together with `unexplained`. The validation target is unknown under 10% on nearly all slow frames.
@@ -52,7 +52,9 @@ All of these are summed over all threads for the frame, so they can exceed its w
 - `tex_uploads`, `tex_unchanged`: texture uploads recorded, and those left out as unchanged. `textures_waiting` is a gauge.
 - `pipelines_asked` (first use by the title), `pipelines_made`, `pipelines_loaded` (from the library), `pipelines_making` (a gauge), `pipeline_waits`, `pipeline_wait_ms`, `dropped` (draws dropped, any reason), `dropped_rt_off` (dispatches left out because rays are off).
 - `ds_reads`, `ds_bytes`, `ds_title_ms` (the title's enqueue to its submit), `ds_queue_ms` (submit to the read's start), `ds_service_ms` (the read).
+- `ds_pending_ms`: the frame's wall time with DirectStorage reads submitted and not done (queued or being read). `unknown_ds_pending_ms`: the part of it that went to an unknown bucket (`title_wait`, `fence_wait`, `unexplained`). A correlate, like `xmem_active_ms`: it says the title's unexplained wait overlapped pending reads, not that it waited for them.
 - `guard_waits`, `guard_wait_ms`, `guard_faults`.
+- `frame_wait_title_ms`, `frame_wait_fence_ms`, `frame_wait_timer_ms`, `frame_wait_other_ms`: the presenting thread's own waits, by what ended them. *Title*: a thread of the title's set, released or woke the object (through the functions the frame log wraps). *Fence*: one of our fences set the event. *Timer*: a sleep. *Other*: a time-out, or a waker we do not see (our own code setting an event directly, a kernel object). A wait on several objects is matched by its first object only.
 - `process_cpu_ms`, `page_faults`, `title_cpu_ms` (the presenting thread's processor time).
 - `ticks`, `tick_max_ms`: the looking thread's looks in the frame and its longest gap. A long gap means the looker was starved and the frame's split is coarse.
 

@@ -4,6 +4,7 @@ usage:
   python -I frames.py <frames.csv>                  drops, peaks, windows, check
   python -I frames.py <frames.csv> --window 10      window length in seconds
   python -I frames.py --compare <a.csv> <b.csv>     two runs side by side
+  --from S --to S                                   only the frames with t_s in [S, S]
   python -I frames.py --self-test                   checks on a made-up log
 
 The CSV holds numbers only, and so does everything this prints.
@@ -16,7 +17,7 @@ import sys
 
 BUCKETS = [
     'present', 'pace', 'preparing', 'submit', 'gpu_wait', 'copy_back', 'guards', 'xmem_title', 'xmem_queue',
-    'pipelines', 'recording', 'title_running', 'title_wait', 'fence_wait', 'unexplained',
+    'pipelines', 'recording', 'dstorage', 'title_running', 'title_wait', 'fence_wait', 'unexplained',
 ]
 # Time nothing of ours explains: a wait of the title's with nothing of ours going on is no reason.
 UNKNOWN = ['unexplained', 'title_wait', 'fence_wait']
@@ -26,11 +27,13 @@ COUNTERS = [
     'title_waits', 'title_wait_ms', 'list_calls', 'submissions', 'tex_uploads', 'pipelines_asked', 'pipelines_made',
     'pipelines_loaded', 'pipeline_wait_ms', 'dropped', 'dropped_rt_off', 'ds_reads', 'ds_bytes', 'ds_queue_ms',
     'guard_waits', 'guard_wait_ms', 'guard_faults', 'page_faults', 'process_cpu_ms',
+    'frame_wait_title_ms', 'frame_wait_fence_ms', 'frame_wait_timer_ms', 'frame_wait_other_ms',
+    'ds_pending_ms', 'unknown_ds_pending_ms',
 ]
 SLOW, FAST, AROUND, LEAST_MS = 1.5, 0.67, 5.0, 40.0
 
 
-def read(path_or_file):
+def read(path_or_file, start=None, end=None):
     f = open(path_or_file, newline='') if isinstance(path_or_file, str) else path_or_file
     rows = []
     for raw in csv.DictReader(f):
@@ -42,7 +45,15 @@ def read(path_or_file):
                 row[k] = None
         rows.append(row)
     # The first line covers the time before the first present seen.
-    return rows[1:]
+    rows = rows[1:]
+    if start is not None or end is not None:
+        lo = float('-inf') if start is None else start
+        hi = float('inf') if end is None else end
+        rows = [r for r in rows if r['t_s'] is not None and lo <= r['t_s'] <= hi]
+    for r in rows:
+        for b in BUCKETS:
+            r.setdefault(b, 0.0)
+    return rows
 
 
 def check(rows, tolerance=0.05):
@@ -118,8 +129,9 @@ def describe(rows, idx, medians):
             continue
         per = counts[c] / n
         base = medians[c]
-        if per > 0 and (base == 0 or per / base >= 2):
-            ratios.append((per / base if base else float('inf'), c, per, base))
+        # (+1: a count of 0.7 against a median of 0 is no news.)
+        if (per + 1) / (base + 1) >= 2:
+            ratios.append(((per + 1) / (base + 1), c, per, base))
     ratios.sort(reverse=True)
     t0, t1 = rows[idx[0]]['t_s'], rows[idx[-1]]['t_s']
     text = (f"t {t0:.1f}-{t1:.1f} s, {n} frames, {wall / n:.0f} ms/frame: "
@@ -146,8 +158,8 @@ def windows(rows, seconds):
     return out
 
 
-def report(path, seconds):
-    rows = read(path)
+def report(path, seconds, start=None, end=None):
+    rows = read(path, start, end)
     if not rows:
         print('no frames')
         return 1
@@ -188,8 +200,8 @@ def report(path, seconds):
     return 0
 
 
-def compare(a, b):
-    ra, rb = read(a), read(b)
+def compare(a, b, start=None, end=None):
+    ra, rb = read(a, start, end), read(b, start, end)
     if not ra or not rb:
         print('a run has no frames')
         return 1
@@ -202,6 +214,13 @@ def compare(a, b):
         va = sum(r.get(k) or 0 for r in ra) / len(ra)
         vb = sum(r.get(k) or 0 for r in rb) / len(rb)
         print(f"  {k:20}{va:>10.2f}{vb:>10.2f}{vb - va:>10.2f}")
+    for side, rs in (('A', ra), ('B', rb)):
+        for kind in ('title', 'queue'):
+            calls = sum(r.get(f'xmem_{kind}_calls') or 0 for r in rs)
+            pages = sum(r.get(f'xmem_{kind}_pages') or 0 for r in rs)
+            msum = sum(r.get(f'xmem_{kind}_ms') or 0 for r in rs)
+            if calls:
+                print(f"  {side} xmem {kind}: {msum / calls:.2f} ms per call, {msum / max(pages, 1):.3f} ms per page")
     print('counts per frame (mean):')
     for k in COUNTERS:
         if k not in ra[0] or k not in rb[0]:
@@ -270,15 +289,17 @@ def main():
     p.add_argument('--window', type=float, default=10.0)
     p.add_argument('--compare', nargs=2, metavar=('A', 'B'))
     p.add_argument('--self-test', action='store_true')
+    p.add_argument('--from', dest='start', type=float)
+    p.add_argument('--to', dest='end', type=float)
     a = p.parse_args()
     if a.self_test:
         return self_test()
     if a.compare:
-        return compare(*a.compare)
+        return compare(*a.compare, a.start, a.end)
     if not a.log:
         p.print_help()
         return 2
-    return report(a.log, a.window)
+    return report(a.log, a.window, a.start, a.end)
 
 
 if __name__ == '__main__':

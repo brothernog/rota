@@ -775,7 +775,10 @@ fn work(scheduler: &'static Scheduler) {
         let started = std::time::Instant::now();
         let traced = Traced::start(&job);
         let reading = victory_gpu::timeline::span("streaming: a request");
-        let result = execute(&job.request);
+        let result = {
+            let _read = victory_gpu::framelog::reading();
+            execute(&job.request)
+        };
         reading.end();
         walls_request(&job.request, &result, started);
         stream_log::request(&job, started, &result);
@@ -797,6 +800,7 @@ fn work(scheduler: &'static Scheduler) {
         }
         lanes = scheduler.lock();
         lanes.finish(&job, result);
+        lanes.note_pending();
         lanes.count(&job, started);
         if std::mem::take(&mut lanes.starved) {
             scheduler.work.notify_all();
@@ -806,6 +810,14 @@ fn work(scheduler: &'static Scheduler) {
 }
 
 impl Lanes {
+    /// Tells the frame log how many reads are submitted and not done.
+    fn note_pending(&self) {
+        if victory_gpu::framelog::on() {
+            let n: usize = self.lanes.values().map(|l| l.reads.len() + l.running.len()).sum();
+            victory_gpu::framelog::ds_pending(n as u32);
+        }
+    }
+
     /// Counts a finished request; every 5 s a debug line sums them up.
     fn count(&mut self, job: &Job, started: std::time::Instant) {
         let (requests, bytes, busy) = &mut self.done;
@@ -919,6 +931,7 @@ impl Lanes {
             }
         }
         lane.flush();
+        self.note_pending();
     }
 }
 
@@ -994,6 +1007,7 @@ fn close_lane(id: u64) {
     lane.unsubmitted.clear();
     lane.reads.clear();
     lane.statuses.clear(); // releases their arrays
+    lanes.note_pending();
     while lanes.lanes.get(&id).is_some_and(|l| !l.running.is_empty()) {
         lanes = scheduler
             .finished

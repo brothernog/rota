@@ -34,7 +34,7 @@ macro_rules! wrapped {
                     // (or the module the title imports it from).
                     let real: unsafe extern "system" fn($($type),*) $(-> $result)? =
                         unsafe { std::mem::transmute(TABLE[$index].1.load(Ordering::Relaxed)) };
-                    if !on() && !(crate::framelog::on() && counted_wait($index)) {
+                    if !on() && !(crate::framelog::on() && counted($index)) {
                         // SAFETY: the caller's own call.
                         return unsafe { real($($arg),*) };
                     }
@@ -45,11 +45,20 @@ macro_rules! wrapped {
     };
 }
 
-/// The wrappers of the title's waits the frame log counts
-/// (`VICTORY_FRAME_LOG`) while no timeline is recorded: the waits, and the
-/// locks after a try that failed ([`lock_of`]).
-const fn counted_wait(index: usize) -> bool {
-    matches!(index, 0 | 1 | 2 | 3 | 7 | 9 | 11 | 13 | 16 | 17 | 20 | 27)
+/// The wrappers the frame log runs (`VICTORY_FRAME_LOG`) while no timeline
+/// is recorded: the title's waits, its locks after a try that failed
+/// ([`lock_of`]), and what wakes them ([`woke`], [`released`]).
+const fn counted(index: usize) -> bool {
+    matches!(index, 0..=20 | 27 | 28)
+}
+
+/// `object` was set or released by a thread of the title's.
+fn woke(name: &'static str, object: u64) {
+    if !on() {
+        crate::framelog::woke(object, crate::framelog::BY_TITLE);
+        return;
+    }
+    woken(name, object);
 }
 
 /// Runs `call`, a wait on `object` that may be long; what the caller may
@@ -104,6 +113,10 @@ fn lock_of(name: &'static str, lock: Handle, take: usize, call: impl FnOnce()) {
 }
 
 fn released(name: &'static str, object: Handle) {
+    if !on() {
+        crate::framelog::woke(object as u64, crate::framelog::BY_TITLE);
+        return;
+    }
     if stood_at(object as u64) {
         woken(name, object as u64);
     }
@@ -124,15 +137,15 @@ wrapped! {
         wait("SleepEx", 0, || unsafe { real(ms, alertable) })
     };
     4 SetEvent(object: Handle) -> i32 => |real: unsafe extern "system" fn(Handle) -> i32| {
-        woken("SetEvent", object as u64);
+        woke("SetEvent", object as u64);
         unsafe { real(object) }
     };
     5 ReleaseSemaphore(object: Handle, count: i32, before: *mut i32) -> i32 => |real: unsafe extern "system" fn(Handle, i32, *mut i32) -> i32| {
-        woken("ReleaseSemaphore", object as u64);
+        woke("ReleaseSemaphore", object as u64);
         unsafe { real(object, count, before) }
     };
     6 ReleaseMutex(object: Handle) -> i32 => |real: unsafe extern "system" fn(Handle) -> i32| {
-        woken("ReleaseMutex", object as u64);
+        woke("ReleaseMutex", object as u64);
         unsafe { real(object) }
     };
     7 EnterCriticalSection(lock: Handle) => |real: unsafe extern "system" fn(Handle)| {

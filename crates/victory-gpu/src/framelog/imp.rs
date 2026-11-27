@@ -181,6 +181,14 @@ impl Drop for RelayIn {
 static XMEM: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
 static PIPELINES: AtomicU32 = AtomicU32::new(0);
 static GUARDS: AtomicU32 = AtomicU32::new(0);
+/// DirectStorage reads being read; reads submitted and not done.
+static READING: AtomicU32 = AtomicU32::new(0);
+static DS_PENDING: AtomicU32 = AtomicU32::new(0);
+
+/// `n` DirectStorage reads are submitted and not done (queued or read).
+pub fn ds_pending(n: u32) {
+    DS_PENDING.store(n, Relaxed);
+}
 
 /// Exact counts, summed over all threads: never reset (the looking thread
 /// takes differences), each name a CSV column (`_ns` ones are written in ms
@@ -214,10 +222,17 @@ pub(crate) enum K {
     GuardWaits,
     GuardWaitNs,
     GuardFaults,
+    /// The presenting thread's waits, by what ended them: a thread of the
+    /// title's (a set, a release, a wake), a fence of ours, a sleep, or
+    /// something else (a time-out, a waker we do not wrap).
+    FrameWaitTitleNs,
+    FrameWaitFenceNs,
+    FrameWaitTimerNs,
+    FrameWaitOtherNs,
     SlotsFull,
 }
 
-const NAMES: [&str; 28] = [
+const NAMES: [&str; 32] = [
     "xmem_title_calls",
     "xmem_title_pages",
     "xmem_title_ns",
@@ -245,6 +260,10 @@ const NAMES: [&str; 28] = [
     "guard_waits",
     "guard_wait_ns",
     "guard_faults",
+    "frame_wait_title_ns",
+    "frame_wait_fence_ns",
+    "frame_wait_timer_ns",
+    "frame_wait_other_ns",
     "slots_full",
 ];
 const _: () = assert!(NAMES.len() == K::SlotsFull as usize + 1);
@@ -363,6 +382,25 @@ impl Drop for XmemCall {
     }
 }
 
+/// A DirectStorage read, counted as being read while it lives.
+pub struct Reading(bool);
+
+/// A DirectStorage read begins.
+pub fn reading() -> Reading {
+    if on() {
+        READING.fetch_add(1, Relaxed);
+    }
+    Reading(on())
+}
+
+impl Drop for Reading {
+    fn drop(&mut self) {
+        if self.0 {
+            READING.fetch_sub(1, Relaxed);
+        }
+    }
+}
+
 /// A DirectStorage read of `bytes` is done: from the title's enqueue to its
 /// submit, from the submit to the read's start, and the read.
 pub fn dstorage(bytes: u64, title_ns: u64, queue_ns: u64, service_ns: u64) {
@@ -387,6 +425,22 @@ pub(crate) fn fence_event(event: usize) {
     }
 }
 
+/// What the presenting thread waits on now (0: nothing, or a sleep), and
+/// what woke it ([`woke`]).
+static FRAME_WAIT: AtomicU64 = AtomicU64::new(0);
+static WAKER: AtomicU8 = AtomicU8::new(0);
+/// Wakers: a thread of the title's, a fence of ours.
+pub(crate) const BY_TITLE: u8 = 1;
+pub(crate) const BY_FENCE: u8 = 2;
+
+/// `object` was set, released or woken `by` one of [`BY_TITLE`], [`BY_FENCE`].
+#[inline]
+pub(crate) fn woke(object: u64, by: u8) {
+    if object != 0 && FRAME_WAIT.load(Relaxed) == object {
+        WAKER.store(by, Relaxed);
+    }
+}
+
 /// One of the title's waits, on `object` (0: none, or a lock).
 pub(crate) fn title_wait<T>(object: u64, call: impl FnOnce() -> T) -> T {
     use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
@@ -398,14 +452,29 @@ pub(crate) fn title_wait<T>(object: u64, call: impl FnOnce() -> T) -> T {
         && object != 0
         && FENCE_EVENTS.lock().unwrap_or_else(|e| e.into_inner()).contains(&(object as usize));
     let state = enter(if fence { State::FenceWait } else { State::TitleWait });
+    if presenting {
+        WAKER.store(0, Relaxed);
+        FRAME_WAIT.store(object, Relaxed);
+    }
     // SAFETY: as above.
     unsafe { SetLastError(error) };
     let result = call();
     // SAFETY: as above.
     let error = unsafe { GetLastError() };
     drop(state);
+    let ns = began.elapsed().as_nanos() as u64;
+    if presenting {
+        FRAME_WAIT.store(0, Relaxed);
+        let by = match (object, WAKER.load(Relaxed)) {
+            (0, _) => K::FrameWaitTimerNs,
+            (_, BY_TITLE) => K::FrameWaitTitleNs,
+            (_, BY_FENCE) => K::FrameWaitFenceNs,
+            _ => K::FrameWaitOtherNs,
+        };
+        count(by, ns);
+    }
     count(K::TitleWaits, 1);
-    count(K::TitleWaitNs, began.elapsed().as_nanos() as u64);
+    count(K::TitleWaitNs, ns);
     // SAFETY: as above.
     unsafe { SetLastError(error) };
     result
@@ -473,8 +542,10 @@ pub(crate) enum Bucket {
     XmemQueue,
     /// Waiting for host pipelines.
     Pipelines,
-    /// List calls of the thread that presents.
+    /// List calls: of the thread that presents, or of others while it waits.
     Recording,
+    /// DirectStorage reads being read while the thread that presents waits.
+    Dstorage,
     /// The thread that presents running (its processor time).
     TitleRunning,
     /// A wait of the title's with nothing of ours going on.
@@ -485,7 +556,7 @@ pub(crate) enum Bucket {
     Unexplained,
 }
 
-const BUCKETS: [&str; 15] = [
+const BUCKETS: [&str; 16] = [
     "present",
     "pace",
     "preparing",
@@ -497,6 +568,7 @@ const BUCKETS: [&str; 15] = [
     "xmem_queue",
     "pipelines",
     "recording",
+    "dstorage",
     "title_running",
     "title_wait",
     "fence_wait",
@@ -514,6 +586,11 @@ pub(crate) struct Seen {
     pub xmem: [bool; 2],
     pub pipelines: bool,
     pub guards: bool,
+    /// Another thread is in a list call.
+    pub recording: bool,
+    pub reading: bool,
+    /// DirectStorage reads are submitted and not done.
+    pub ds_pending: bool,
     /// After a present, before the first list call.
     pub pre_list: bool,
 }
@@ -545,6 +622,8 @@ fn ours(s: &Seen) -> Option<Bucket> {
         .or(s.xmem[1].then_some(Bucket::XmemQueue))
         .or(s.pipelines.then_some(Bucket::Pipelines))
         .or(s.guards.then_some(Bucket::Guards))
+        .or(s.recording.then_some(Bucket::Recording))
+        .or(s.reading.then_some(Bucket::Dstorage))
 }
 
 /// The bucket of a tick that is not the presenting thread's running time.
@@ -578,13 +657,17 @@ pub(crate) struct Frame {
     pub buckets: [u64; BUCKETS.len()],
     pub pre_list: u64,
     pub xmem: u64,
+    /// The wall time with DirectStorage reads pending, and the part of it
+    /// that went to an unknown bucket.
+    pub ds_pending: u64,
+    pub unknown_ds: u64,
     /// The presenting thread's processor time not yet given to ticks.
     credit: u64,
 }
 
 impl Frame {
     pub(crate) fn new(presents: u64, began: u64, credit: u64) -> Frame {
-        Frame { presents, began, buckets: [0; BUCKETS.len()], pre_list: 0, xmem: 0, credit }
+        Frame { presents, began, buckets: [0; BUCKETS.len()], pre_list: 0, xmem: 0, ds_pending: 0, unknown_ds: 0, credit }
     }
 
     /// The presenting thread ran `us` more.
@@ -608,7 +691,14 @@ impl Frame {
             self.buckets[Bucket::TitleRunning as usize] += running;
             us -= running;
         }
-        self.buckets[bucket(seen) as usize] += us;
+        let b = bucket(seen);
+        self.buckets[b as usize] += us;
+        if seen.ds_pending {
+            self.ds_pending += to.saturating_sub(from);
+            if matches!(b, Bucket::TitleWait | Bucket::FenceWait | Bucket::Unexplained) {
+                self.unknown_ds += us;
+            }
+        }
     }
 
     /// The wall time so far, ended at `at`.
@@ -624,7 +714,7 @@ pub(crate) fn header() -> String {
         h.push(',');
         h.push_str(b);
     }
-    h.push_str(",pre_list_ms,xmem_active_ms,title_cpu_ms");
+    h.push_str(",pre_list_ms,xmem_active_ms,ds_pending_ms,unknown_ds_pending_ms,title_cpu_ms");
     for n in NAMES {
         h.push(',');
         match n.strip_suffix("_ns") {
@@ -663,15 +753,26 @@ impl Looker {
     fn look(&mut self) -> (Seen, u64) {
         let slot = FRAME_SLOT.load(Relaxed);
         let (frame, thread) = SLOT.get(slot).map_or((State::Title, 0), |s| (State::of(s.state.load(Relaxed)), s.thread.load(Relaxed)));
-        let seen = Seen {
+        let mut seen = Seen {
             frame,
             phase: PHASE.load(Relaxed),
             relay: RELAY.load(Relaxed),
             xmem: [XMEM[0].load(Relaxed) > 0, XMEM[1].load(Relaxed) > 0],
             pipelines: PIPELINES.load(Relaxed) > 0,
             guards: GUARDS.load(Relaxed) > 0,
+            recording: false,
+            reading: READING.load(Relaxed) > 0,
+            ds_pending: DS_PENDING.load(Relaxed) > 0,
             pre_list: crate::copystat::phase() == 0,
         };
+        // Other threads' list calls, looked for only when they could matter.
+        if matches!(seen.frame, State::Title | State::TitleWait | State::FenceWait) {
+            let given = NEXT.load(Relaxed).min(SLOTS);
+            seen.recording = SLOT[..given]
+                .iter()
+                .enumerate()
+                .any(|(i, s)| i != slot && s.state.load(Relaxed) == State::List as u8);
+        }
         (seen, self.ran(thread))
     }
 
@@ -718,7 +819,7 @@ impl Looker {
         for b in f.buckets {
             let _ = write!(row, ",{}", ms(b));
         }
-        let _ = write!(row, ",{},{},{}", ms(f.pre_list), ms(f.xmem), ms(cpu_us));
+        let _ = write!(row, ",{},{},{},{},{}", ms(f.pre_list), ms(f.xmem), ms(f.ds_pending), ms(f.unknown_ds), ms(cpu_us));
         for (i, name) in NAMES.iter().enumerate() {
             let now = total(i);
             let n = now - self.counts[i].min(now);
@@ -859,7 +960,18 @@ mod tests {
     use super::*;
 
     fn seen(frame: State) -> Seen {
-        Seen { frame, phase: 0, relay: 0, xmem: [false; 2], pipelines: false, guards: false, pre_list: false }
+        Seen {
+            frame,
+            phase: 0,
+            relay: 0,
+            xmem: [false; 2],
+            pipelines: false,
+            guards: false,
+            recording: false,
+            reading: false,
+            ds_pending: false,
+            pre_list: false,
+        }
     }
 
     /// A wait of the title's goes to what of ours goes on, the submission
@@ -868,6 +980,10 @@ mod tests {
     fn waits_go_to_what_of_ours_runs() {
         let mut s = seen(State::TitleWait);
         assert_eq!(bucket(&s), Bucket::TitleWait);
+        s.reading = true;
+        assert_eq!(bucket(&s), Bucket::Dstorage);
+        s.recording = true;
+        assert_eq!(bucket(&s), Bucket::Recording);
         s.guards = true;
         assert_eq!(bucket(&s), Bucket::Guards);
         s.pipelines = true;
@@ -941,7 +1057,7 @@ mod tests {
     #[test]
     fn the_header_names_every_column() {
         let h = header();
-        assert_eq!(h.split(',').count(), 4 + BUCKETS.len() + 3 + NAMES.len() + 8);
+        assert_eq!(h.split(',').count(), 4 + BUCKETS.len() + 5 + NAMES.len() + 8);
         assert!(h.contains(",xmem_title_ms,") && h.contains(",unexplained,") && !h.contains("_ns"));
     }
 }
