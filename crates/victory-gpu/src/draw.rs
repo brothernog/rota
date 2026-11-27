@@ -529,6 +529,19 @@ fn heap_spread() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SPREAD").is_none_or(|v| v != "0"))
 }
 
+/// Whether the heap buffer pass leaves unmarked the slots it makes itself
+/// (`VICTORY_HEAP_PASS_UNMARKED=1`; off by default). The pass takes in the
+/// copy of every slot it makes, but making it marked the slot written, and
+/// the next pass looked at it once more for nothing. A slot whose buffer has
+/// no host copy yet is still marked, and looked at again.
+///
+/// After realblastex/flamingo d56f7b0 (`mirror_unmarked`; there 14,089 to
+/// 9,111 slots looked at a frame, the pass 31.6 to 27.0 ms).
+fn heap_pass_unmarked() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_PASS_UNMARKED").is_some_and(|v| v == "1"))
+}
+
 /// The host copy and range the buffer view of each of a heap's slots reads
 /// ([`State::heap_buffers`]), by slot.
 #[derive(Default)]
@@ -820,10 +833,22 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         if host.copied_tabled(index, frame) {
             return None;
         }
-        let view = host.mirror(index, heap.handle(index)?, true)?;
+        // ([`heap_pass_unmarked`]: whether a mark for the next pass was left out.)
+        let unmarked = std::cell::Cell::new(false);
+        let view = if heap_pass_unmarked() {
+            host.mirror_unmarked(index, heap.handle(index)?, &unmarked)?
+        } else {
+            host.mirror(index, heap.handle(index)?, true)?
+        };
         // The copy the slot shows (`buffer_copy`), not the one the
         // view's range alone would find.
-        let (shadow, address, len) = crate::descriptor::host::buffer_copy(&view)?;
+        let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+            // No host copy yet: the next pass looks again, as the mark had it.
+            if unmarked.get() {
+                host.mark_buffer(index);
+            }
+            return None;
+        };
         #[cfg(feature = "diagnostics")]
         if host.shows(index, &shadow.buffer) == Some(false) {
             HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
