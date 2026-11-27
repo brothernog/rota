@@ -3628,7 +3628,12 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     LATE_WAITED[why.min(10)].fetch_add(us, Ordering::Relaxed);
     SUBMISSION_US[1].fetch_add(us, Ordering::Relaxed);
     #[cfg(feature = "diagnostics")]
-    blamed(why, us);
+    {
+        blamed(why, us);
+        if census::on() {
+            census::waited(why, us);
+        }
+    }
 }
 
 /// What the thread that lands flights fetches card copies' pieces with
@@ -3690,6 +3695,10 @@ fn relay_worker() {
                     break Err(fences[0].unwrap_or(0));
                 }
                 line.settling = true;
+                #[cfg(feature = "diagnostics")]
+                if census::on() {
+                    census::landing_begins();
+                }
                 let items: Vec<Late> = line.line.drain(..n).collect();
                 line.in_hand = items
                     .iter()
@@ -3985,6 +3994,8 @@ fn late_line(frames: f64) {
 pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
+#[cfg(feature = "diagnostics")]
+pub(crate) mod census;
 #[cfg(any(test, feature = "diagnostics"))]
 pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
@@ -5908,6 +5919,8 @@ impl Host {
         } else if own.is_none()
             && let Some(why) = late_blocked(runs)
         {
+            #[cfg(feature = "diagnostics")]
+            let census = census::before(runs);
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
@@ -5916,6 +5929,10 @@ impl Host {
                 });
             } else {
                 self.settle(&mut submitted, why);
+            }
+            #[cfg(feature = "diagnostics")]
+            if let Some(census) = census {
+                census::after(census);
             }
         } else if own.as_ref().is_some_and(card_steps::Taken::waits) {
             // The check's second level, or `VICTORY_STEP_WAIT`: the steps are
