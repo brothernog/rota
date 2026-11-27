@@ -20,9 +20,6 @@
 //! `VICTORY_CARD_RING_MB`: its size (128 by default), as slots of 64 KiB,
 //! rounded down to a power of two.
 
-// shortcut: nothing calls these until the shadow is wired in.
-#![allow(dead_code)]
-
 use super::*;
 
 /// Bytes of the index ahead of the slots: as the compare's results.
@@ -133,9 +130,208 @@ impl Placed {
 
 /// Since the last frame-rate line: pieces found in the ring, their bytes,
 /// pieces that did not fit, pieces whose bytes are not what the compare
-/// hashed, parts the fetch brought that were looked for in the ring, and
-/// those of them not as the ring has them.
-pub(super) static STATS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+/// hashed, parts the fetch brought that were looked for in the ring, those
+/// of them not as the ring has them, nanoseconds the compares with the ring
+/// took on the card, and the compares timed.
+pub(super) static STATS: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+/// Compares with the ring whose card time is taken: pairs of timestamps.
+const STAMPED: u32 = 1024;
+
+/// What the host keeps for the ring (`CardWork::ring`).
+pub(super) struct CardRing {
+    pub(super) root: ID3D12RootSignature,
+    pub(super) pso: ID3D12PipelineState,
+    /// Index and slots: PC memory, mapped (buffer, mapping).
+    buffer: (ID3D12Resource, usize),
+    /// The next slot number, on the card.
+    counter: ID3D12Resource,
+    slots: u32,
+    /// Timestamps ahead of and behind each compare with the ring, the
+    /// memory they come back to (mapped), and the card's ticks a second.
+    stamps: (ID3D12QueryHeap, ID3D12Resource, usize, u64),
+    /// The next pair of them.
+    next: u32,
+}
+
+impl CardRing {
+    /// A pair of timestamps for the next compare with the ring.
+    pub(super) fn stamp(&mut self) -> u32 {
+        let at = self.next;
+        self.next = (at + 1) % STAMPED;
+        at
+    }
+
+    /// Before the compare's passes (its root signature set): the ring's
+    /// buffers, and the first timestamp.
+    ///
+    /// # Safety
+    /// The list is open.
+    pub(super) unsafe fn begin(&self, list: &ID3D12GraphicsCommandList, stamp: u32) {
+        // SAFETY: the caller's; live buffers.
+        unsafe {
+            list.SetComputeRootUnorderedAccessView(4, self.buffer.0.GetGPUVirtualAddress());
+            list.SetComputeRootUnorderedAccessView(5, self.counter.GetGPUVirtualAddress());
+            list.EndQuery(&self.stamps.0, D3D12_QUERY_TYPE_TIMESTAMP, 2 * stamp);
+        }
+    }
+
+    /// After them: the second timestamp, and both on their way back.
+    ///
+    /// # Safety
+    /// The list is open.
+    pub(super) unsafe fn end(&self, list: &ID3D12GraphicsCommandList, stamp: u32) {
+        // SAFETY: the caller's; the mapping holds `STAMPED` pairs.
+        unsafe {
+            list.EndQuery(&self.stamps.0, D3D12_QUERY_TYPE_TIMESTAMP, 2 * stamp + 1);
+            list.ResolveQueryData(&self.stamps.0, D3D12_QUERY_TYPE_TIMESTAMP, 2 * stamp, 2, &self.stamps.1, u64::from(stamp) * 16);
+        }
+    }
+
+    /// The tail and the ring's slots, as the compare takes them.
+    pub(super) fn told(&self) -> (u32, u32) {
+        (TAIL.load(Ordering::Relaxed), self.slots)
+    }
+}
+
+impl Host {
+    /// The ring's pipeline and buffers ([`mode`] not 0).
+    pub(super) fn make_card_ring(&self) -> windows::core::Result<CardRing> {
+        let empty = windows::core::Error::empty;
+        let (root, pso) = self.make_compare(&card_compare_ring())?;
+        // (Not the compare's name: the replay reads that one's constants.)
+        #[cfg(feature = "diagnostics")]
+        name(&pso, || "victory: card compare with the ring".into());
+        let slots = slots();
+        let (buffer, data) = self.shared_buffer(bytes(slots)).ok_or_else(empty)?;
+        name(&buffer, || "card ring".into());
+        let counter = self.uav_buffer(64).ok_or_else(empty)?;
+        name(&counter, || "card ring, next slot".into());
+        let (back, at) = self.shared_buffer(16 * u64::from(STAMPED)).ok_or_else(empty)?;
+        // SAFETY: plain object creation; a fresh mapping of that size.
+        let (heap, frequency) = unsafe {
+            std::ptr::write_bytes(at, 0, 16 * STAMPED as usize);
+            let mut heap: Option<ID3D12QueryHeap> = None;
+            self.device.CreateQueryHeap(
+                &D3D12_QUERY_HEAP_DESC {
+                    Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+                    Count: 2 * STAMPED,
+                    NodeMask: 0,
+                },
+                &mut heap,
+            )?;
+            (heap.ok_or_else(empty)?, self.queue.GetTimestampFrequency().unwrap_or(0))
+        };
+        tracing::info!(slots, mb = bytes(slots) >> 20, "the card ring (VICTORY_CARD_RING=3, the shadow: landing still fetches)");
+        Ok(CardRing {
+            root,
+            pso,
+            buffer: (buffer, data as usize),
+            counter,
+            slots,
+            stamps: (heap, back, at as usize, frequency),
+            next: 0,
+        })
+    }
+}
+
+/// What a landing found in the ring, until the fetch has come.
+pub(super) struct Look {
+    placed: Placed,
+    data: usize,
+    /// The first number not landed once these plans are.
+    tail: u32,
+}
+
+/// For the plans being landed (their compares have run), in order: the
+/// pieces their compares put in the ring are hashed and checked against
+/// what the compares said, and the card time of those compares counted.
+/// `None` without the ring or without such plans.
+pub(super) fn look(plans: &[(&CardPlan, u64)], differs: &[u32]) -> Option<Look> {
+    if plans.iter().all(|p| p.0.ring.is_none()) {
+        return None;
+    }
+    let (data, slots, back, frequency) = {
+        let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
+        let ring = work.as_ref()?.ring.as_ref()?;
+        (ring.buffer.1, ring.slots, ring.stamps.2, ring.stamps.3)
+    };
+    // SAFETY: the ring's mapping, the index first. These plans' dwords are
+    // given to no other plan before they are done with (as `differs`), and
+    // no compare takes a slot past the tail, which moves when they are.
+    let index = unsafe { std::slice::from_raw_parts(data as *const u32, INDEX / 4) };
+    let mut tail = TAIL.load(Ordering::Relaxed);
+    let mut found = Vec::new();
+    for &(plan, _) in plans {
+        let Some(stamp) = plan.ring else {
+            continue;
+        };
+        // SAFETY: the mapping holds `STAMPED` pairs; the compare has run.
+        let [from, to] = unsafe { (back as *const [u64; 2]).add(stamp as usize).read_volatile() };
+        if to > from && frequency > 0 {
+            STATS[6].fetch_add((u128::from(to - from) * 1_000_000_000 / u128::from(frequency)) as u64, Ordering::Relaxed);
+            STATS[7].fetch_add(1, Ordering::Relaxed);
+        }
+        let ranges: Vec<&CardRange> = plan.ranges.iter().filter(|r| r.compared && !r.picked).collect();
+        let spans: Vec<(u32, u32)> = ranges.iter().map(|r| (r.at, r.span.pieces)).collect();
+        for (r, p, entry, result) in flagged(&spans, differs, index) {
+            tail = tail_after(tail, entry);
+            let Some(slot) = slot_at(entry, slots) else {
+                STATS[2].fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            let (r, piece) = (ranges[r], ranges[r].span.first + p);
+            let (from, to) = r.shadow.card_hashed(piece);
+            let len = to.saturating_sub(from).min(SLOT);
+            // SAFETY: inside the mapping (a slot); the compare has run.
+            let bytes = unsafe { std::slice::from_raw_parts((data + slot) as *const u8, len) };
+            STATS[0].fetch_add(1, Ordering::Relaxed);
+            STATS[1].fetch_add(len as u64, Ordering::Relaxed);
+            if torn::hash(bytes) != torn::folded(result) {
+                STATS[3].fetch_add(1, Ordering::Relaxed);
+            }
+            found.push(((std::sync::Arc::as_ptr(&r.shadow) as usize, piece), slot));
+        }
+    }
+    Some(Look { placed: Placed::new(found), data, tail })
+}
+
+impl Look {
+    /// What the fetch brought (`landed`, from `fetched` on) is compared with
+    /// what the ring has of the same pieces.
+    ///
+    /// # Safety
+    /// What was fetched is at `fetched`, as `landed` says.
+    pub(super) unsafe fn against(&self, landed: &[torn::Landed], fetched: usize) {
+        for (shadow, lo, hi, at) in landed {
+            let piece = shadow.card_piece_of(*lo);
+            let (from, _) = shadow.card_hashed(piece);
+            if *lo < from || hi - from > SLOT {
+                continue;
+            }
+            let Some(slot) = self.placed.part_at((std::sync::Arc::as_ptr(shadow) as usize, piece), *lo, from) else {
+                continue;
+            };
+            // SAFETY: inside the ring's mapping (checked above), and the
+            // caller's.
+            let (ring, came) = unsafe {
+                (
+                    std::slice::from_raw_parts((self.data + slot) as *const u8, hi - lo),
+                    std::slice::from_raw_parts((fetched + *at as usize) as *const u8, hi - lo),
+                )
+            };
+            STATS[4].fetch_add(1, Ordering::Relaxed);
+            if ring != came {
+                STATS[5].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// The landing is done with the ring: later compares may use its slots.
+    pub(super) fn done(self) {
+        TAIL.store(self.tail, Ordering::Relaxed);
+    }
+}
 
 #[cfg(test)]
 mod tests {
