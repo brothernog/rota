@@ -17,6 +17,11 @@
 //! `VICTORY_CARD_RING=3`, the shadow: the ring is filled and checked against
 //! the compare's hashes and against what the fetch brings, and the fetch
 //! still lands everything.
+//! `VICTORY_CARD_RING=4`: pieces land from the ring. Each plan's pieces land
+//! in plan order, each with title bytes sent after its own send left out
+//! (`CardPlan::sent_as`: the slot holds what its flight ended with). A piece
+//! that did not fit, whose slot is not what the compare hashed, or that the
+//! compare did not look at, is fetched as before, and lands after the ring.
 //! `VICTORY_CARD_RING_MB`: its size (128 by default), as slots of 64 KiB,
 //! rounded down to a power of two.
 
@@ -32,17 +37,24 @@ const NUMBER: u32 = 0x7FFF_FFFF;
 /// The most slots: the end of the last one fits in the shader's 32 bits.
 const MOST: u32 = 1 << 15;
 
-/// `VICTORY_CARD_RING`: 3 is the shadow; anything else is off.
+/// `VICTORY_CARD_RING`: 3 is the shadow, 4 lands from the ring; anything
+/// else is off.
 pub(super) fn mode() -> u8 {
     static MODE: OnceLock<u8> = OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("VICTORY_CARD_RING").as_deref() {
         Ok("3") => 3,
+        Ok("4") => 4,
         Ok("" | "0") | Err(_) => 0,
         Ok(other) => {
-            tracing::warn!(value = other, "VICTORY_CARD_RING: only 3 (the shadow) is made so far; the ring is off");
+            tracing::warn!(value = other, "VICTORY_CARD_RING: only 3 (the shadow) and 4 (landing from it) are made; the ring is off");
             0
         }
     })
+}
+
+/// Whether pieces land from the ring (`VICTORY_CARD_RING=4`).
+pub(super) fn lands() -> bool {
+    mode() == 4
 }
 
 /// The ring's slots (`VICTORY_CARD_RING_MB`).
@@ -132,8 +144,11 @@ impl Placed {
 /// pieces that did not fit, pieces whose bytes are not what the compare
 /// hashed, parts the fetch brought that were looked for in the ring, those
 /// of them not as the ring has them, nanoseconds the compares with the ring
-/// took on the card, and the compares timed.
-pub(super) static STATS: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+/// took on the card, and the compares timed. Then, landing from the ring
+/// ([`lands`]): parts landed from it, parts left to the fetch, microseconds
+/// merging from the ring, microseconds looking through it (index and
+/// hashes), landings with no fetch, and landings.
+pub(super) static STATS: [std::sync::atomic::AtomicU64; 14] = [const { std::sync::atomic::AtomicU64::new(0) }; 14];
 
 /// Compares with the ring whose card time is taken: pairs of timestamps.
 const STAMPED: u32 = 1024;
@@ -222,7 +237,12 @@ impl Host {
             )?;
             (heap.ok_or_else(empty)?, self.queue.GetTimestampFrequency().unwrap_or(0))
         };
-        tracing::info!(slots, mb = bytes(slots) >> 20, "the card ring (VICTORY_CARD_RING=3, the shadow: landing still fetches)");
+        tracing::info!(
+            slots,
+            mb = bytes(slots) >> 20,
+            mode = mode(),
+            "the card ring (VICTORY_CARD_RING: 3 is the shadow, landing still fetches; 4 lands from it)"
+        );
         Ok(CardRing {
             root,
             pso,
@@ -237,10 +257,49 @@ impl Host {
 
 /// What a landing found in the ring, until the fetch has come.
 pub(super) struct Look {
+    /// Every piece found, for the shadow's check of the fetch.
     placed: Placed,
-    data: usize,
+    /// By plan (in the order given): the pieces its compare put in the ring
+    /// as it hashed them, which may land from there.
+    own: Vec<Placed>,
+    /// The ring's mapping.
+    pub(super) data: usize,
     /// The first number not landed once these plans are.
     tail: u32,
+}
+
+/// Of one plan's flagged pieces (`flagged`'s), with each piece's copy and
+/// number and the bytes its slot holds (`piece`, given the range and the
+/// piece in it): each found in `ring` (the mapping, index first), with its
+/// slot and whether the slot holds what the compare hashed. Pieces that did
+/// not fit are left out. The tail moves past every one.
+pub(super) fn sort_out(
+    found: &[(usize, u32, u32, u32)],
+    ring: &[u8],
+    slots: u32,
+    tail: &mut u32,
+    mut piece: impl FnMut(usize, u32) -> ((usize, u32), usize),
+) -> Vec<((usize, u32), usize, bool)> {
+    let mut out = Vec::with_capacity(found.len());
+    for &(r, p, entry, result) in found {
+        *tail = tail_after(*tail, entry);
+        let Some(slot) = slot_at(entry, slots) else {
+            STATS[2].fetch_add(1, Ordering::Relaxed);
+            continue;
+        };
+        let (key, len) = piece(r, p);
+        let Some(bytes) = ring.get(slot..slot + len.min(SLOT)) else {
+            continue;
+        };
+        STATS[0].fetch_add(1, Ordering::Relaxed);
+        STATS[1].fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        let as_hashed = torn::hash(bytes) == torn::folded(result);
+        if !as_hashed {
+            STATS[3].fetch_add(1, Ordering::Relaxed);
+        }
+        out.push((key, slot, as_hashed));
+    }
+    out
 }
 
 /// For the plans being landed (their compares have run), in order: the
@@ -251,6 +310,7 @@ pub(super) fn look(plans: &[(&CardPlan, u64)], differs: &[u32]) -> Option<Look> 
     if plans.iter().all(|p| p.0.ring.is_none()) {
         return None;
     }
+    let looking = std::time::Instant::now();
     let (data, slots, back, frequency) = {
         let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
         let ring = work.as_ref()?.ring.as_ref()?;
@@ -259,11 +319,15 @@ pub(super) fn look(plans: &[(&CardPlan, u64)], differs: &[u32]) -> Option<Look> 
     // SAFETY: the ring's mapping, the index first. These plans' dwords are
     // given to no other plan before they are done with (as `differs`), and
     // no compare takes a slot past the tail, which moves when they are.
+    let mapping = unsafe { std::slice::from_raw_parts(data as *const u8, bytes(slots) as usize) };
+    // SAFETY: as above; the index is the mapping's first bytes, aligned.
     let index = unsafe { std::slice::from_raw_parts(data as *const u32, INDEX / 4) };
     let mut tail = TAIL.load(Ordering::Relaxed);
     let mut found = Vec::new();
+    let mut own = Vec::with_capacity(plans.len());
     for &(plan, _) in plans {
         let Some(stamp) = plan.ring else {
+            own.push(Placed::default());
             continue;
         };
         // SAFETY: the mapping holds `STAMPED` pairs; the compare has run.
@@ -274,29 +338,32 @@ pub(super) fn look(plans: &[(&CardPlan, u64)], differs: &[u32]) -> Option<Look> 
         }
         let ranges: Vec<&CardRange> = plan.ranges.iter().filter(|r| r.compared && !r.picked).collect();
         let spans: Vec<(u32, u32)> = ranges.iter().map(|r| (r.at, r.span.pieces)).collect();
-        for (r, p, entry, result) in flagged(&spans, differs, index) {
-            tail = tail_after(tail, entry);
-            let Some(slot) = slot_at(entry, slots) else {
-                STATS[2].fetch_add(1, Ordering::Relaxed);
-                continue;
-            };
+        let sorted = sort_out(&flagged(&spans, differs, index), mapping, slots, &mut tail, |r, p| {
             let (r, piece) = (ranges[r], ranges[r].span.first + p);
             let (from, to) = r.shadow.card_hashed(piece);
-            let len = to.saturating_sub(from).min(SLOT);
-            // SAFETY: inside the mapping (a slot); the compare has run.
-            let bytes = unsafe { std::slice::from_raw_parts((data + slot) as *const u8, len) };
-            STATS[0].fetch_add(1, Ordering::Relaxed);
-            STATS[1].fetch_add(len as u64, Ordering::Relaxed);
-            if torn::hash(bytes) != torn::folded(result) {
-                STATS[3].fetch_add(1, Ordering::Relaxed);
-            }
-            found.push(((std::sync::Arc::as_ptr(&r.shadow) as usize, piece), slot));
-        }
+            ((std::sync::Arc::as_ptr(&r.shadow) as usize, piece), to.saturating_sub(from))
+        });
+        own.push(Placed::new(sorted.iter().filter(|s| s.2).map(|s| (s.0, s.1))));
+        found.extend(sorted.into_iter().map(|s| (s.0, s.1)));
     }
-    Some(Look { placed: Placed::new(found), data, tail })
+    STATS[11].fetch_add(looking.elapsed().as_micros() as u64, Ordering::Relaxed);
+    Some(Look { placed: Placed::new(found), own, data, tail })
 }
 
 impl Look {
+    /// Where in the ring (from `data` on) the part `[lo, hi)` of a piece
+    /// lies, for plan `plan` (its place in the plans given), the piece
+    /// hashed over `hashed` (`Shadow::card_hashed`): `None` where that
+    /// plan's compare did not put the piece there as it hashed it, or the
+    /// slot does not hold the part.
+    pub(super) fn part(&self, plan: usize, piece: (usize, u32), lo: usize, hi: usize, hashed: (usize, usize)) -> Option<u64> {
+        let (from, to) = hashed;
+        if lo < from || hi > to || hi - from > SLOT {
+            return None;
+        }
+        Some(self.own.get(plan)?.part_at(piece, lo, from)? as u64)
+    }
+
     /// What the fetch brought (`landed`, from `fetched` on) is compared with
     /// what the ring has of the same pieces.
     ///
@@ -399,5 +466,55 @@ mod tests {
         // from offset 130,067 rounded down to 130,064.
         assert_eq!(placed.part_at((1, 2), 130_067, 130_064), Some(INDEX + 2 * SLOT + 3));
         assert_eq!(placed.part_at((1, 3), 200_000, 195_600), Some(INDEX + SLOT + 4_400));
+    }
+
+    /// Of three flagged pieces, one did not fit (the ring overflowed) and
+    /// one's slot is not what the compare hashed: only the third may land
+    /// from the ring, and the tail moves past all three.
+    #[test]
+    fn what_did_not_fit_or_is_not_as_hashed_lands_through_the_fetch() {
+        let slots = 4;
+        let len = 4096;
+        let mut ring = vec![0u8; bytes(slots) as usize];
+        for s in 0..slots as usize {
+            ring[INDEX + s * SLOT..][..len].fill(s as u8 + 1);
+        }
+        // A result: flagged, and the piece's hash as the compare made it.
+        let result = |ring: &[u8], s: usize| (torn::hash(&ring[INDEX + s * SLOT..][..len]) << 1) | 1;
+        let (fits, flipped) = (result(&ring, 1), result(&ring, 2));
+        ring[INDEX + 2 * SLOT + 100] ^= 0xFF;
+        let found = [(0, 0, FULL | 4, result(&ring, 0)), (0, 1, 6, flipped), (1, 0, 5, fits)];
+        let mut tail = 4;
+        let out = sort_out(&found, &ring, slots, &mut tail, |r, p| ((0xC0 + r, p), len));
+        assert_eq!(out, [((0xC0, 1), INDEX + 2 * SLOT, false), ((0xC1, 0), INDEX + SLOT, true)]);
+        assert_eq!(tail, 7);
+        // All did not fit: nothing for the ring, the tail still moves.
+        let mut tail = 0;
+        let full = [(0, 0, FULL, 1), (0, 1, FULL | 1, 1)];
+        assert!(sort_out(&full, &ring, slots, &mut tail, |r, p| ((r, p), len)).is_empty());
+        assert_eq!(tail, 2);
+    }
+
+    /// A part lands from the ring only from a slot its own plan's compare
+    /// filled as it hashed it, and only where the slot holds all of it.
+    #[test]
+    fn a_part_lands_from_its_own_plans_slot_and_only_inside_it() {
+        let look = Look {
+            placed: Placed::default(),
+            own: vec![Placed::new([((1, 2), INDEX + SLOT)]), Placed::default()],
+            data: 0,
+            tail: 0,
+        };
+        let (from, to) = (131_056, 131_056 + 65_552);
+        assert_eq!(look.part(0, (1, 2), from + 16, from + 400, (from, to)), Some((INDEX + SLOT + 16) as u64));
+        assert_eq!(look.part(0, (1, 2), from, to, (from, to)), Some((INDEX + SLOT) as u64));
+        // Another plan's, another piece, no such plan.
+        assert_eq!(look.part(1, (1, 2), from + 16, from + 400, (from, to)), None);
+        assert_eq!(look.part(0, (1, 3), from + 16, from + 400, (from, to)), None);
+        assert_eq!(look.part(2, (1, 2), from + 16, from + 400, (from, to)), None);
+        // Outside what the slot holds.
+        assert_eq!(look.part(0, (1, 2), from - 16, from + 400, (from, to)), None);
+        assert_eq!(look.part(0, (1, 2), from + 16, to + 16, (from, to)), None);
+        assert_eq!(look.part(0, (1, 2), from, from + SLOT + 16, (from, from + SLOT + 16)), None);
     }
 }
