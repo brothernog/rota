@@ -142,16 +142,27 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     }
 }
 
+/// How many frames apart [`wanted`] saves pictures in the world
+/// (`VICTORY_CAPTURE_EVERY=<n>`, 8; twice that before it). Each saved frame
+/// waits for the card, so a run that is timed wants them sparse.
+fn every() -> u64 {
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        std::env::var("VICTORY_CAPTURE_EVERY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8).max(1)
+    })
+}
+
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
     // Before the world, with `VICTORY_CAPTURE_WORLD`: every 16th frame too
     // (small pictures of menus, loading screens and title cards).
-    let before_world = world_on() && n.is_multiple_of(16) && WORLD.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX;
+    let before_world =
+        world_on() && n.is_multiple_of(2 * every()) && WORLD.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX;
     // In the world: every 8th frame's picture, a timeline of the opening
     // cutscene (its shots do not fall on the same frame numbers from run to
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
-    let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
+    let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(every());
     folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
 }
 
