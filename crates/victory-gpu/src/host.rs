@@ -5567,9 +5567,9 @@ impl Host {
             } else {
                 self.settle(&mut submitted, why);
             }
-        } else if own.is_some() && card_steps::check() == 2 {
-            // The check's second level: the steps are done on the card
-            // behind the wait they took off all the same.
+        } else if own.as_ref().is_some_and(card_steps::Taken::waits) {
+            // The check's second level, or `VICTORY_STEP_WAIT`: the steps are
+            // done on the card behind the wait they took off all the same.
             relay_wait(WHY_READ, |line| blocked_by(&line.written, runs, false).is_none());
         }
         if let Some(own) = &mut own {
