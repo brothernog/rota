@@ -957,6 +957,7 @@ fn create() -> windows::core::Result<Host> {
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
+        log_card(&device, adapter.as_ref(), &o1);
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
@@ -974,6 +975,65 @@ fn create() -> windows::core::Result<Host> {
             presenter: Mutex::new(None),
             adapter,
         })
+    }
+}
+
+/// The driver's version as the system gives it (four 16-bit parts, the
+/// first highest), written the way the vendor's tools show it.
+fn driver_version(v: i64) -> String {
+    let p = |shift: u32| (v >> shift) as u16;
+    format!("{}.{}.{}.{}", p(48), p(32), p(16), p(0))
+}
+
+/// One line at the start naming the card, its driver and what it can do
+/// that shaders depend on, so that two players' logs can be compared when
+/// a picture is wrong on one card and right on another (the same build
+/// draws faces with square patches on one card generation and clean on the
+/// next).
+///
+/// # Safety
+/// A live device.
+unsafe fn log_card(device: &ID3D12Device, adapter: Option<&IDXGIAdapter3>, o1: &D3D12_FEATURE_DATA_D3D12_OPTIONS1) {
+    // SAFETY: plain queries, each writing its own structure of the given size.
+    unsafe {
+        let desc = adapter.and_then(|a| a.GetDesc1().ok());
+        let name = desc.map(|d| {
+            let n = d.Description.iter().position(|&c| c == 0).unwrap_or(d.Description.len());
+            String::from_utf16_lossy(&d.Description[..n])
+        });
+        let driver = adapter.map_or(0, |a| a.CheckInterfaceSupport(&IDXGIDevice::IID).unwrap_or(0));
+        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+        let _ = device.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, (&raw mut o).cast(), size_of_val(&o) as u32);
+        let mut o4 = D3D12_FEATURE_DATA_D3D12_OPTIONS4::default();
+        let _ = device.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS4, (&raw mut o4).cast(), size_of_val(&o4) as u32);
+        let mut o5 = D3D12_FEATURE_DATA_D3D12_OPTIONS5::default();
+        let _ = device.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, (&raw mut o5).cast(), size_of_val(&o5) as u32);
+        // The highest the runtime knows answers; an older runtime refuses
+        // a model it does not know, so ask down from 6.9.
+        let model = [0x69, 0x68, 0x67, 0x66, 0x65].into_iter().find_map(|m| {
+            let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL { HighestShaderModel: D3D_SHADER_MODEL(m) };
+            device
+                .CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, (&raw mut sm).cast(), size_of_val(&sm) as u32)
+                .is_ok()
+                .then_some(sm.HighestShaderModel.0)
+        });
+        tracing::info!(
+            card = name.as_deref().unwrap_or("not known"),
+            vendor = format_args!("{:#x}", desc.map_or(0, |d| d.VendorId)),
+            device = format_args!("{:#x}", desc.map_or(0, |d| d.DeviceId)),
+            driver = driver_version(driver),
+            shader_model = format_args!("{:x}", model.unwrap_or(0)),
+            wave_ops = o1.WaveOps.as_bool(),
+            int64 = o1.Int64ShaderOps.as_bool(),
+            native_16bit = o4.Native16BitShaderOpsSupported.as_bool(),
+            min_precision = o.MinPrecisionSupport.0,
+            tiled_tier = o.TiledResourcesTier.0,
+            binding_tier = o.ResourceBindingTier.0,
+            typed_uav_loads = o.TypedUAVLoadAdditionalFormats.as_bool(),
+            rovs = o.ROVsSupported.as_bool(),
+            raytracing_tier = o5.RaytracingTier.0,
+            "host card"
+        );
     }
 }
 
@@ -1018,6 +1078,14 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    /// The driver's version reads as the vendor's tools show it.
+    #[test]
+    fn driver_version_reads_as_four_parts() {
+        let v = (32_i64 << 48) | (0_i64 << 32) | (16_i64 << 16) | 1088;
+        assert_eq!(super::driver_version(v), "32.0.16.1088");
+        assert_eq!(super::driver_version(0), "0.0.0.0");
+    }
+
     /// A list of ours is found by its name, with the debug layer's note or not.
     #[cfg(feature = "diagnostics")]
     #[test]
