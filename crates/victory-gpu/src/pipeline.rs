@@ -364,7 +364,8 @@ fn names_are_found_by_hash() {
 /// screen tiles the title marks for rays (the cascades' shadow edges, hair).
 /// With every ray a miss those tiles come out lit, so leaving them out is a
 /// picture change: opt-in (`VICTORY_SKIP_RT_SHADOW=1`). After edsuuu/VI-BR-PORT
-/// a04f601.
+/// a04f601. The three kinds are told apart (their place in the list below
+/// less 8) so that `VICTORY_SKIP_RT_SHADOW_KINDS` can leave out some of them.
 #[cfg(windows)]
 fn for_rays(bytes: &[u8]) -> RayOnly {
     const NAMES: [Named; 11] = [
@@ -389,8 +390,8 @@ fn for_rays(bytes: &[u8]) -> RayOnly {
         RayOnly::Activate
     } else if (has(4) && has(5)) || (has(6) && !has(7)) {
         RayOnly::Trace
-    } else if has(8) || has(9) || has(10) {
-        RayOnly::ShadowMask
+    } else if let Some(k) = (8..11).find(|&i| has(i)) {
+        RayOnly::ShadowMask((k - 8) as u8)
     } else {
         RayOnly::No
     }
@@ -405,14 +406,16 @@ enum RayOnly {
     Resolve,
     Activate,
     Trace,
-    ShadowMask,
+    /// Which of the three kinds.
+    ShadowMask(u8),
 }
 
 /// Whether a dispatch of `this` is left out because it only serves rays,
 /// and nothing they could hit is there: every ray is a miss
 /// (`VICTORY_RT_MISS=1`) and the structure builder is off. Each kind runs
 /// anyway with its switch: `VICTORY_RT_SKIN=1`, `VICTORY_RT_RESOLVE=1`, `VICTORY_RT_TRACE=1`,
-/// `VICTORY_ACTIVATE_RAYS=1`; the shadow kind runs unless `VICTORY_SKIP_RT_SHADOW=1`.
+/// `VICTORY_ACTIVATE_RAYS=1`; the shadow kinds run unless `VICTORY_SKIP_RT_SHADOW=1`
+/// (all three) or `VICTORY_SKIP_RT_SHADOW_KINDS=<bits>` (bit k: kind k) asks.
 #[cfg(windows)]
 pub(crate) fn skips_rt_skin(this: This) -> bool {
     fn off(switch: &str) -> bool {
@@ -424,7 +427,7 @@ pub(crate) fn skips_rt_skin(this: This) -> bool {
     static RESOLVE: OnceLock<bool> = OnceLock::new();
     static ACTIVATE: OnceLock<bool> = OnceLock::new();
     static TRACE: OnceLock<bool> = OnceLock::new();
-    static SHADOW: OnceLock<bool> = OnceLock::new();
+    static SHADOW: OnceLock<u8> = OnceLock::new();
     if this.is_null() {
         return false;
     }
@@ -435,9 +438,30 @@ pub(crate) fn skips_rt_skin(this: This) -> bool {
         RayOnly::Activate => *ACTIVATE.get_or_init(|| off("VICTORY_ACTIVATE_RAYS")),
         RayOnly::Trace => *TRACE.get_or_init(|| off("VICTORY_RT_TRACE")),
         // Opt-in: it changes the picture (`VICTORY_SKIP_RT_SHADOW=1`).
-        RayOnly::ShadowMask => *SHADOW.get_or_init(|| {
-            std::env::var_os("VICTORY_SKIP_RT_SHADOW").is_some_and(|v| v == "1") && off("VICTORY_RT_SHADOW")
-        }),
+        RayOnly::ShadowMask(kind) => {
+            let bits = *SHADOW.get_or_init(|| {
+                if !off("VICTORY_RT_SHADOW") {
+                    return 0;
+                }
+                if std::env::var_os("VICTORY_SKIP_RT_SHADOW").is_some_and(|v| v == "1") {
+                    return 0b111;
+                }
+                std::env::var("VICTORY_SKIP_RT_SHADOW_KINDS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+            });
+            note_shadow_kind(kind, bits);
+            (bits >> kind) & 1 == 1
+        }
+    }
+}
+
+/// Says once per kind that a shadow-mask program was dispatched, and whether
+/// it is left out: which kinds a scene runs.
+#[cfg(windows)]
+fn note_shadow_kind(kind: u8, bits: u8) {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static SEEN: AtomicU8 = AtomicU8::new(0);
+    if SEEN.fetch_or(1 << kind, Ordering::Relaxed) & (1 << kind) == 0 {
+        tracing::info!(kind, left_out = (bits >> kind) & 1 == 1, "a ray shadow-mask dispatch (VICTORY_SKIP_RT_SHADOW_KINDS)");
     }
 }
 
