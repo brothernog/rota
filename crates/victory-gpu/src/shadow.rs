@@ -1040,7 +1040,18 @@ fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize,
 
 #[cfg(test)]
 mod relay_tests {
-    use super::{Flights, changed_runs, merge_piece, outside};
+    use super::{Flights, PAGE, changed_runs, merge_piece, outside, shaders_wrote};
+
+    /// The guard sees a page that shaders' writes landed in, and not its
+    /// neighbours.
+    #[test]
+    fn pages_shaders_wrote_lately_are_seen() {
+        let page = 0x6123_4560_0000 / PAGE;
+        assert!(!shaders_wrote(&[page]));
+        crate::watch::landing(page * PAGE + 4096, 8);
+        assert!(shaders_wrote(&[page - 1, page]));
+        assert!(!shaders_wrote(&[page + 1]));
+    }
 
     /// A range two flights declared is free only when both are done, in
     /// either order; a submission that declares it many times counts once.
@@ -1948,8 +1959,33 @@ fn back_piece(
 }
 
 /// Since the last frame-rate line, of [`Shadow::merge_under_writes`]: pages
-/// compared, changed runs put in, and their bytes.
-static MERGED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// compared, changed runs put in, their bytes, the runs of those on pages
+/// shaders' writes landed in lately ([`merge_guard`]), and ranges it held
+/// back.
+static MERGED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// Frames back that [`merge_guard`] looks for shaders' writes in a page.
+const GUARD_FRAMES: u64 = 120;
+
+/// Whether [`Shadow::merge_under_writes`] leaves a range to the wait for the
+/// flights when shaders' writes landed in one of its pages to put in within
+/// the last [`GUARD_FRAMES`] frames (`VICTORY_MERGE_GUARD=1`; off by
+/// default). The title's bytes put in under a flight's declared writes win
+/// over what its shaders write there; where shaders do write, the title's
+/// bytes may be older than the shaders' (written before the flight landed,
+/// from what it read before). With `VICTORY_CARD_STEPS` many more such
+/// pages are put in (the fills no longer settle the flights first), and the
+/// picture went to bands and blots in runs STEP_CHECK=1 and LATE_WAIT=2 of
+/// 2026-11-26, while with the old wait (STEP_CHECK=2) it did not.
+fn merge_guard() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MERGE_GUARD").is_some_and(|v| v == "1"))
+}
+
+/// Whether one of `pages` (by number) had shaders' writes land in it lately.
+fn shaders_wrote(pages: &[usize]) -> bool {
+    pages.iter().any(|&p| crate::watch::landed_lately(p * PAGE, PAGE, GUARD_FRAMES))
+}
 
 /// Why [`Shadow::merge_under_writes`] last left the caller to wait.
 static STALE_WHY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -1961,18 +1997,19 @@ fn note_stale(why: usize) {
 /// [`STALE_WHY`] in words (diagnostics).
 #[cfg(feature = "diagnostics")]
 pub(crate) fn stale_why() -> &'static str {
-    const WHY: [&str; 4] = [
+    const WHY: [&str; 5] = [
         "the memory is not watched",
         "the journal does not say what was written",
         "more changed runs than a submission sends up",
         "no snapshot",
+        "shaders wrote there lately (VICTORY_MERGE_GUARD)",
     ];
-    WHY[STALE_WHY.load(Ordering::Relaxed).min(3)]
+    WHY[STALE_WHY.load(Ordering::Relaxed).min(4)]
 }
 
 /// [`MERGED`], taken.
-pub(crate) fn merged_stats() -> [u64; 3] {
-    [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
+pub(crate) fn merged_stats() -> [u64; 5] {
+    [0, 1, 2, 3, 4].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
 }
 
 /// The runs of bytes where `now` differs from `was` (of one length), as
@@ -3533,6 +3570,11 @@ impl Shadow {
             if stale.is_empty() {
                 continue;
             }
+            if merge_guard() && shaders_wrote(&stale) {
+                MERGED[4].fetch_add(1, Ordering::Relaxed);
+                note_stale(4);
+                return true;
+            }
             // The lock of the copy's reference (the snapshot, or the
             // CPU's side of a copy in the card's memory), from before
             // title memory is read until the title's bytes are in: with
@@ -3590,6 +3632,9 @@ impl Shadow {
                 let (lo, hi) = ((stale[i] * PAGE).max(a), ((stale[i] + 1) * PAGE).min(e));
                 MERGED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
                 MERGED[2].fetch_add(runs.iter().map(|r| r.1 as u64).sum(), Ordering::Relaxed);
+                if !runs.is_empty() && shaders_wrote(&stale[i..=i]) {
+                    MERGED[3].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                }
                 self.card_changed_runs(runs.into_iter().map(|(r, m)| (lo - start + r, lo - start + r + m)));
                 // Taken, if the range holds all of the page that is in the
                 // copy; else the rest of it is the refresh's, which notes

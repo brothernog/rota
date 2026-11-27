@@ -658,6 +658,20 @@ pub(crate) fn constant_slot(
     }
 }
 
+/// The buffer dynamic slot `index` of the host heap behind the title heap at
+/// `heap` holds on to (by address), if that heap still exists and it holds one.
+#[cfg(windows)]
+pub(crate) fn slot_shows(heap: usize, index: u32) -> Option<usize> {
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    if heaps.iter().any(|&(_, _, h)| h == heap)
+        // SAFETY: registered heaps are live (removed when dropped).
+        && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
+    {
+        return host.kept_in(index).map(|r| windows::core::Interface::as_raw(&r) as usize);
+    }
+    None
+}
+
 #[cfg(windows)]
 impl Drop for Heap {
     fn drop(&mut self) {

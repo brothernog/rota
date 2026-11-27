@@ -1234,7 +1234,9 @@ pub extern "system" fn XMemMapPhysicalPages(
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
     // into that gap (`victory_gpu::title_memory_remapping`).
-    let _changing = victory_gpu::title_memory_remapping();
+    let _changing = victory_gpu::title_memory_remapping_in(|| {
+        remapping_extent(&physical, base, n.checked_mul(PAGE)?).map(|r| vec![r])
+    });
     unmap(&mut physical, base, n * PAGE);
     let Some(pages) = pages else {
         return address;
@@ -1318,7 +1320,7 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let _busy = Busy::begin();
     let mut physical = physical();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
-    let _changing = victory_gpu::title_memory_remapping();
+    let _changing = victory_gpu::title_memory_remapping_in(|| remapping_extent(&physical, to, len).map(|r| vec![r]));
     unmap(&mut physical, to, len);
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
@@ -1371,7 +1373,7 @@ pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
             ops.push(Op::new(to, slice.flatten()));
             at += 1;
         }
-        let _changing = victory_gpu::title_memory_remapping();
+        let _changing = victory_gpu::title_memory_remapping_in(|| batch_extents(&physical, &ops));
         ok &= change(&mut physical, ops);
     }
     ok
@@ -1409,7 +1411,7 @@ fn scatter(wanted: &[(usize, usize)]) -> bool {
         if let Some(costed) = &mut costed {
             costed.pages = Some(ops.len());
         }
-        let _changing = victory_gpu::title_memory_remapping();
+        let _changing = victory_gpu::title_memory_remapping_in(|| batch_extents(&physical, &ops));
         ok &= change(&mut physical, ops);
     }
     ok
@@ -1417,6 +1419,34 @@ fn scatter(wanted: &[(usize, usize)]) -> bool {
 
 /// Pages changed under the locks at once.
 const GROUP: usize = 64;
+
+/// Every address a change of `len` bytes at `base` can take away from a read
+/// in place (`victory_gpu::title_memory_remapping_in`): `unmap` removes whole
+/// views, so the one holding `base` and the last one starting before the
+/// end count whole. Views do not overlap, which leaves no other to reach past
+/// either end. `None`: not known (unaligned, empty or overflowing), so
+/// the change holds off every read.
+fn remapping_extent(physical: &Physical, base: usize, len: usize) -> Option<std::ops::Range<usize>> {
+    if len == 0 || !base.is_multiple_of(PAGE) {
+        return None;
+    }
+    let mut end = base.checked_add(len.checked_next_multiple_of(PAGE)?)?;
+    let mut start = base;
+    if let Some((&at, (size, _))) = physical.views.range(..=base).next_back()
+        && at.checked_add(*size)? > base
+    {
+        start = at;
+    }
+    if let Some((&at, (size, _))) = physical.views.range(..end).next_back() {
+        end = end.max(at.checked_add(*size)?);
+    }
+    Some(start..end)
+}
+
+/// [`remapping_extent`] of each page `ops` changes; `None` if one is not known.
+fn batch_extents(physical: &Physical, ops: &[Op]) -> Option<Vec<std::ops::Range<usize>>> {
+    ops.iter().map(|op| remapping_extent(physical, op.at, PAGE)).collect()
+}
 
 /// How many threads map a group of pages side by side (`VICTORY_MAP_THREADS`;
 /// 8 unless set; 1: the caller alone, a page after the other; `auto`: 1 while
@@ -2648,6 +2678,17 @@ mod tests {
         let second = b.wrapping_byte_add(PAGE);
         assert_eq!(XMemMapPhysicalPages(second, 2, pages[1..].as_ptr()), second);
         let (a, second) = (a as usize, second as usize);
+        {
+            // A change of the middle page takes its whole view away: the
+            // extent holds the page, stays in the pages of `a`, and an
+            // unknown or overflowing one is not scoped.
+            let table = physical();
+            let extent = remapping_extent(&table, a + PAGE, 1).unwrap();
+            assert!(extent.start >= a && extent.start <= a + PAGE && extent.end >= a + 2 * PAGE && extent.end <= a + 3 * PAGE);
+            assert_eq!(remapping_extent(&table, a + 1, PAGE), None);
+            assert_eq!(remapping_extent(&table, a, 0), None);
+            assert_eq!(remapping_extent(&table, usize::MAX - PAGE + 1, PAGE), None);
+        }
         let sorted = |mut runs: Vec<(usize, usize)>| {
             runs.sort_unstable();
             runs

@@ -122,6 +122,40 @@ impl Target {
     }
 
     pub(crate) fn owner(&self) -> usize { self.ticket.owner }
+
+    /// Whether the texture's memory is still the one registered: not
+    /// reused or remapped since ([`replaced`], [`remapped`], [`released`]).
+    pub(crate) fn fresh(&self) -> bool { self.ticket.valid.load(Ordering::Acquire) }
+}
+
+/// What a write of a back-copied texture does to a list's wanted targets.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Want {
+    /// A fresh target for it is there already.
+    Have,
+    /// The target at this index went stale (its memory was reused or
+    /// remapped): it is made again in place.
+    Again(usize),
+    /// None for it yet.
+    New,
+}
+
+/// [`Want`] for a write of `owner`, given the list's targets as (owner,
+/// fresh). A stale entry used to stop the search, and the read-back of the
+/// memory the texture is in now was dropped. From spk-c/victory-fork
+/// 0b4c9c8 (SLP-DEV1, GPL-3.0).
+pub(crate) fn want(targets: impl IntoIterator<Item = (usize, bool)>, owner: usize) -> Want {
+    let mut stale = None;
+    for (i, (of, fresh)) in targets.into_iter().enumerate() {
+        if of != owner {
+            continue;
+        }
+        if fresh {
+            return Want::Have;
+        }
+        stale.get_or_insert(i);
+    }
+    stale.map_or(Want::New, Want::Again)
 }
 
 /// The readback resources and the allocation the pixels belong to.
@@ -269,5 +303,17 @@ mod tests {
         released(93);
         assert!(!far.valid.load(Ordering::Acquire));
         assert!(track(94, 0x2000, 0x3000).valid.load(Ordering::Acquire));
+    }
+
+    /// A texture written again after its memory was reused is read back
+    /// again, in the stale entry's place; a fresh entry is kept.
+    #[test]
+    fn a_stale_target_is_made_again() {
+        assert_eq!(want([], 7), Want::New);
+        assert_eq!(want([(3, true), (7, true)], 7), Want::Have);
+        assert_eq!(want([(3, true), (7, false)], 7), Want::Again(1));
+        assert_eq!(want([(7, false), (7, true)], 7), Want::Have);
+        assert_eq!(want([(7, false), (7, false)], 7), Want::Again(0));
+        assert_eq!(want([(3, false)], 7), Want::New);
     }
 }

@@ -207,6 +207,11 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     p.made.get()?.as_ref()
 }
 
+/// Whether making `p` has ended (with a host pipeline or without one).
+pub(crate) fn made(p: &Pending) -> bool {
+    p.made.get().is_some()
+}
+
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
 /// that is making it); whether it has a host pipeline.
 pub(crate) fn now(p: &Arc<Pending>) -> bool {

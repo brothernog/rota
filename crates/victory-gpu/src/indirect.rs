@@ -961,6 +961,242 @@ void main() {
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
     }
 
+    /// The compare of copies in the card's memory, with or without the ring
+    /// (`crate::host::ring`), on the software adapter: its buffers, all
+    /// mapped (the ring's counter too, so that a test can read and set it).
+    struct CardRig {
+        compare: Clamp,
+        ring_on: bool,
+        now: (ID3D12Resource, *mut u8, u64),
+        hashes: (ID3D12Resource, *mut u8, u64),
+        differs: (ID3D12Resource, *mut u8, u64),
+        ring: (ID3D12Resource, *mut u8, u64),
+        counter: (ID3D12Resource, *mut u8, u64),
+        slots: u32,
+    }
+
+    const RING_INDEX: usize = 1 << 20;
+    const RING_SLOT: usize = 65_600;
+    const CARD_PIECE: usize = 64 << 10;
+
+    impl CardRig {
+        /// For a copy of `size` bytes holding `content`.
+        fn new(warp: &WarpHarness, ring_on: bool, content: &[u8], slots: u32) -> CardRig {
+            let source = if ring_on { crate::host::card_compare_ring() } else { crate::host::CARD_COMPARE.to_string() };
+            let compare = compile_cs(&warp.device, &source).expect("the card compare must compile on WARP");
+            let now = warp.shared_buffer(content.len() as u64);
+            let ring = warp.shared_buffer((RING_INDEX + slots as usize * RING_SLOT) as u64);
+            // SAFETY: the mappings hold that many bytes.
+            unsafe {
+                std::ptr::copy_nonoverlapping(content.as_ptr(), now.1, content.len());
+                std::ptr::write_bytes(ring.1, 0xEE, RING_INDEX + slots as usize * RING_SLOT);
+            }
+            CardRig {
+                compare,
+                ring_on,
+                now,
+                hashes: warp.shared_buffer(16 * 64),
+                differs: warp.shared_buffer(4 * 64),
+                ring,
+                counter: warp.shared_buffer(64),
+                slots,
+            }
+        }
+
+        /// One pass of `pieces` pieces from `first`, for a copy of `size`
+        /// bytes that starts `skew` bytes into piece 0: of each piece, what
+        /// it left in `differs` and in the ring's index (7 where nothing).
+        fn pass(&self, warp: &mut WarpHarness, (first, pieces, skew, size): (u32, u32, u32, u32), mode: u32, tail: u32) -> Vec<(u32, u32)> {
+            let index = self.ring.1.cast::<u32>();
+            // SAFETY: our open list, live buffers, the compare's own root
+            // signature; the mappings hold what is read and written.
+            unsafe {
+                for p in 0..pieces as usize {
+                    self.differs.1.cast::<u32>().add(p).write_volatile(7);
+                    index.add(p).write_volatile(7);
+                }
+                warp.list.SetComputeRootSignature(&self.compare.root);
+                warp.list.SetPipelineState(&self.compare.pso);
+                let constants = [first, skew, size, pieces, 0, mode, tail, self.slots];
+                warp.list.SetComputeRoot32BitConstants(0, if self.ring_on { 8 } else { 6 }, constants.as_ptr().cast(), 0);
+                warp.list.SetComputeRootShaderResourceView(1, self.now.2);
+                warp.list.SetComputeRootUnorderedAccessView(2, self.hashes.2);
+                warp.list.SetComputeRootUnorderedAccessView(3, self.differs.2);
+                if self.ring_on {
+                    warp.list.SetComputeRootUnorderedAccessView(4, self.ring.2);
+                    warp.list.SetComputeRootUnorderedAccessView(5, self.counter.2);
+                }
+                warp.list.Dispatch(pieces, 1, 1);
+            }
+            warp.submit_and_wait();
+            // SAFETY: as above; the card is done with them.
+            (0..pieces as usize)
+                .map(|p| unsafe { (self.differs.1.cast::<u32>().add(p).read_volatile(), index.add(p).read_volatile()) })
+                .collect()
+        }
+
+        fn counter(&self) -> u32 {
+            // SAFETY: inside the mapping; the card is done with it.
+            unsafe { self.counter.1.cast::<u32>().read_volatile() }
+        }
+
+        fn set_counter(&self, value: u32) {
+            // SAFETY: inside the mapping; nothing on the card.
+            unsafe { self.counter.1.cast::<u32>().write_volatile(value) }
+        }
+
+        /// The first `len` bytes of the slot an index entry names.
+        fn slot(&self, entry: u32, len: usize) -> &[u8] {
+            assert_eq!(entry & 0x8000_0000, 0, "the entry says it did not fit");
+            let at = RING_INDEX + (entry & (self.slots - 1)) as usize * RING_SLOT;
+            // SAFETY: inside the mapping; the card is done with it.
+            unsafe { std::slice::from_raw_parts(self.ring.1.add(at).cast_const(), len) }
+        }
+
+        fn now(&self, from: usize, to: usize) -> &[u8] {
+            // SAFETY: inside the mapping; the card is done with it.
+            unsafe { std::slice::from_raw_parts(self.now.1.add(from).cast_const(), to - from) }
+        }
+
+        fn set(&self, at: usize, value: u8) {
+            // SAFETY: inside the mapping; nothing on the card.
+            unsafe { self.now.1.add(at).write_volatile(value) }
+        }
+    }
+
+    fn card_content(size: usize) -> Vec<u8> {
+        (0..size).map(|i| (i * 31 + i / 251) as u8).collect()
+    }
+
+    /// With the ring, told 3: a piece that changed is flagged as told 2,
+    /// and copied whole into the slot whose number its index dword holds;
+    /// one that did not is left alone and takes no slot.
+    #[test]
+    fn warp_card_ring_copies_a_flagged_piece_whole() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let content = card_content(3 * CARD_PIECE);
+        let rig = CardRig::new(&warp, true, &content, 4);
+        let all = (0, 3, 0, content.len() as u32);
+        rig.pass(&mut warp, all, 0, 0);
+        // Nothing changed: no flag, no slot, the index untouched.
+        let found = rig.pass(&mut warp, all, 3, 0);
+        assert!(found.iter().all(|&(d, i)| d & 1 == 0 && i == 7), "{found:x?}");
+        assert_eq!(rig.counter(), 0);
+        rig.set(CARD_PIECE + 1234, content[CARD_PIECE + 1234] ^ 0x40);
+        let found = rig.pass(&mut warp, all, 3, 0);
+        assert_eq!(found.iter().map(|f| f.0 & 1).collect::<Vec<_>>(), [0, 1, 0]);
+        assert_eq!((found[0].1, found[1].1, found[2].1), (7, 0, 7));
+        assert_eq!(rig.counter(), 1);
+        let slot = rig.slot(found[1].1, CARD_PIECE);
+        assert!(slot == rig.now(CARD_PIECE, 2 * CARD_PIECE), "the slot holds the piece");
+        assert_eq!(found[1].0 >> 1, crate::host::piece_hash(slot));
+        // Past the piece, and the next slot, as they were.
+        assert!(rig.slot(1, RING_SLOT).iter().all(|&b| b == 0xEE));
+        // Its hash was stored: not flagged again.
+        assert!(rig.pass(&mut warp, all, 3, 0).iter().all(|&(d, i)| d & 1 == 0 && i == 7));
+        assert_eq!(rig.counter(), 1);
+    }
+
+    /// A slot number past what the tail allows says so in its top bit and
+    /// copies nothing; the number is spent all the same. Numbers go round
+    /// the ring, and round 31 bits.
+    #[test]
+    fn warp_card_ring_says_when_a_piece_does_not_fit() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let content = card_content(3 * CARD_PIECE);
+        let rig = CardRig::new(&warp, true, &content, 2);
+        let all = (0, 3, 0, content.len() as u32);
+        rig.pass(&mut warp, all, 0, 0);
+        let change = |n: u8| (0..3).for_each(|p| rig.set(p * CARD_PIECE + 99, content[p * CARD_PIECE + 99] ^ n));
+        change(1);
+        let found = rig.pass(&mut warp, all, 3, 0);
+        assert!(found.iter().all(|f| f.0 & 1 == 1));
+        let mut numbers: Vec<u32> = found.iter().map(|f| f.1).collect();
+        numbers.sort_unstable();
+        assert_eq!(numbers, [0, 1, 0x8000_0002]);
+        for (p, &(_, entry)) in found.iter().enumerate().filter(|f| f.1.1 & 0x8000_0000 == 0) {
+            assert!(rig.slot(entry, CARD_PIECE) == rig.now(p * CARD_PIECE, (p + 1) * CARD_PIECE), "piece {p}");
+        }
+        // Landed up to 3: 3 and 4 fit, in slots 1 and 0.
+        change(2);
+        let found = rig.pass(&mut warp, (0, 2, 0, content.len() as u32), 3, 3);
+        let mut numbers: Vec<u32> = found.iter().map(|f| f.1).collect();
+        numbers.sort_unstable();
+        assert_eq!(numbers, [3, 4]);
+        for (p, &(_, entry)) in found.iter().enumerate() {
+            assert!(rig.slot(entry, CARD_PIECE) == rig.now(p * CARD_PIECE, (p + 1) * CARD_PIECE), "piece {p}");
+        }
+        // Round 31 bits: 0x7FFF_FFFF, then 0 (the counter's 0x8000_0000).
+        rig.set_counter(0x7FFF_FFFF);
+        change(3);
+        let found = rig.pass(&mut warp, (0, 1, 0, content.len() as u32), 3, 0x7FFF_FFFF);
+        assert_eq!(found[0].1, 0x7FFF_FFFF);
+        change(4);
+        let found = rig.pass(&mut warp, (0, 1, 0, content.len() as u32), 3, 0x7FFF_FFFF);
+        assert_eq!(found[0].1, 0);
+        assert!(rig.slot(0, CARD_PIECE) == rig.now(0, CARD_PIECE));
+    }
+
+    /// A copy that starts within its first piece and ends within its last:
+    /// what lands in a slot is what the hash covered, widened to 16 bytes
+    /// (`Shadow::card_hashed`).
+    #[test]
+    fn warp_card_ring_cuts_a_skewed_piece_as_the_hash_does() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let content = card_content(4 * CARD_PIECE);
+        let rig = CardRig::new(&warp, true, &content, 4);
+        let (skew, size) = (1005usize, 3 * CARD_PIECE - 100);
+        let all = (0, 4, skew as u32, size as u32);
+        let cut = |p: usize| ((p * CARD_PIECE).saturating_sub(skew) & !15, ((p + 1) * CARD_PIECE - skew).min(size).next_multiple_of(16));
+        rig.pass(&mut warp, all, 0, 0);
+        // (Near the end: the 16 bytes at the start are the piece before's too.)
+        for p in [0, 3] {
+            let at = cut(p).1 - 20;
+            rig.set(at, content[at] ^ 0x10);
+        }
+        let found = rig.pass(&mut warp, all, 3, 0);
+        assert_eq!(found.iter().map(|f| f.0 & 1).collect::<Vec<_>>(), [1, 0, 0, 1]);
+        for p in [0, 3] {
+            let (lo, hi) = cut(p);
+            let slot = rig.slot(found[p].1, hi - lo);
+            assert!(slot == rig.now(lo, hi), "piece {p}: {lo:#x}..{hi:#x}");
+            assert_eq!(found[p].0 >> 1, crate::host::piece_hash(slot), "piece {p}");
+            // Nothing past it.
+            assert_eq!(rig.slot(found[p].1, hi - lo + 1)[hi - lo], 0xEE, "piece {p}");
+        }
+    }
+
+    /// Told 0, 1 or 2, the compare with the ring does what the one without
+    /// it does, and takes no slot.
+    #[test]
+    fn warp_card_ring_keeps_modes_0_1_and_2() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let content = card_content(3 * CARD_PIECE);
+        let rigs = [CardRig::new(&warp, false, &content, 4), CardRig::new(&warp, true, &content, 4)];
+        let all = (0, 3, 0, content.len() as u32);
+        let at = 2 * CARD_PIECE + 5;
+        let steps: [(Option<u8>, u32); 8] =
+            [(None, 0), (None, 1), (Some(0x40), 1), (None, 1), (Some(0), 1), (Some(0x40), 2), (None, 2), (Some(0), 2)];
+        for (step, (change, mode)) in steps.into_iter().enumerate() {
+            let found = rigs.each_ref().map(|rig| {
+                if let Some(x) = change {
+                    rig.set(at, content[at] ^ x);
+                }
+                rig.pass(&mut warp, all, mode, 0).iter().map(|f| f.0).collect::<Vec<_>>()
+            });
+            assert_eq!(found[0], found[1], "step {step}");
+        }
+        assert_eq!(rigs[1].counter(), 0);
+    }
+
     /// What the passes over copies in the card's memory cost on the card
     /// (ignored: a measurement): rounds of a few passes of some pieces and a
     /// wait, as a frame has them. `VICTORY_BENCH_CS=<file>` times another

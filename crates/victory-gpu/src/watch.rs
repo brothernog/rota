@@ -329,6 +329,16 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     if journal().kept {
         return;
     }
+    // View memory the guards know is left to `writes`, which answers it from
+    // the guards: asked here it fails, is asked again by halves, and fails
+    // once more in `writes` ([`view_known`]).
+    if view_known() {
+        let g = guards();
+        pieces.retain(|&(first, _)| !known_view_block(&g, first * PAGE / BLOCK));
+        if pieces.len() < 2 {
+            return;
+        }
+    }
     let _all = Asking::hold_all();
     let (mut asked, mut written) = (Vec::new(), Vec::new());
     let mut i = 0;
@@ -550,8 +560,15 @@ fn ask_rest(ranges: &[(usize, usize)]) {
     // askings a frame with the switch on, as without it). They are asked
     // here, once; what is not write-watched stays with `writes`.
     let mut written = Vec::new();
-    for &(start, end) in ranges {
-        if start >= end || published(start, end) {
+    // ([`view_known`]: view memory the guards know is left to `writes`.)
+    let known: Vec<bool> = if view_known() {
+        let g = guards();
+        ranges.iter().map(|&(start, _)| known_view_block(&g, start / BLOCK)).collect()
+    } else {
+        Vec::new()
+    };
+    for (i, &(start, end)) in ranges.iter().enumerate() {
+        if start >= end || published(start, end) || known.get(i).copied().unwrap_or(false) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
@@ -684,7 +701,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     let mut guards_asked = false;
     // (View memory read-only by our hand: the kernel would refuse.)
-    let refused = guarded && light() && PROTECTED.any(first, last);
+    let refused = guarded && (light() && PROTECTED.any(first, last) || view_known() && known_view_block(&guards(), first * PAGE / BLOCK));
     let pages = match if refused { None } else { kernel_written(first, last) } {
         Some(pages) => pages,
         None => {
@@ -1387,6 +1404,10 @@ struct Guards {
     aliased: Blocks,
     /// Blocks opened by a write fault, and when ([`rest`]).
     opened: std::collections::HashMap<usize, std::time::Instant, std::hash::BuildHasherDefault<PageHash>>,
+    /// With [`view_known`]: blocks known to be view memory since they were
+    /// first made read-only or the runtime last mapped or unmapped them,
+    /// whether guarded now or not.
+    viewed: Blocks,
 }
 
 impl Guards {
@@ -1423,7 +1444,43 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     changing: Vec::new(),
     aliased: Blocks::new(),
     opened: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+    viewed: Blocks::new(),
 });
+
+/// Whether a block once made read-only stays known as view memory while its
+/// guard is open (`VICTORY_VIEW_KNOWN=1`; off by default): a range whose first
+/// block the title wrote since its last check is then not asked of the
+/// kernel's write watch (which can only refuse view memory), nor of Windows
+/// (`is_view`, a walk of the page tables). The runtime mapping a section's
+/// pages there makes blocks known too ([`title_memory_remapped`]); its
+/// unmapping them ([`title_memory_unmapping`]) and the title freeing the
+/// memory ([`title_memory_freed`]) forget them: a hole may be given up and
+/// be other memory with no word of the runtime's.
+///
+/// After KomanderDG88/VIniVIdiVIci f644da3 (`VICTORY_VIEW_KNOWN`; there
+/// 338-450 refused askings a frame and 6.5-7.8 ms a frame of the submitting
+/// thread in `VirtualQuery`), whose kernel half came from triippywhale
+/// d0581a5 and fxceless/victory-fork#670.
+fn view_known() -> bool {
+    #[cfg(test)]
+    if VIEW_KNOWN_HERE.get() {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_KNOWN").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`view_known`] on for what this thread does.
+    static VIEW_KNOWN_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// With [`view_known`]: whether `block` is view memory the guards know,
+/// guarded, noted absent, or remembered.
+fn known_view_block(g: &Guards, block: usize) -> bool {
+    g.protected.contains(block) || g.absent.contains(block) || g.viewed.contains(block)
+}
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
     if let Ok(g) = GUARDS.try_lock() {
@@ -1646,7 +1703,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"))
         && (PROTECTED.any(first, first + 1) || {
             let g = guards_timed();
-            g.protected.contains(first) || g.absent.contains(first)
+            g.protected.contains(first) || g.absent.contains(first) || (view_known() && g.viewed.contains(first))
         });
     if !known && !is_view(start, end) {
         return None;
@@ -1688,6 +1745,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     for &(block, view) in &came {
         if g.absent.remove(block) && !view {
             g.foreign.insert(block);
+            g.viewed.remove(block);
         }
     }
     // The range's blocks that are neither clean nor known to be holes. A
@@ -1871,6 +1929,9 @@ fn protect_alias(g: &mut Guards, block: usize) -> bool {
     }
     if done && matches!(old, PAGE_READWRITE | PAGE_READONLY) {
         g.protected.insert(block);
+        if view_known() {
+            g.viewed.insert(block);
+        }
         #[cfg(feature = "diagnostics")]
         crate::faultbook::note(crate::faultbook::What::Alias, block, 0, 0);
         return true;
@@ -1917,6 +1978,9 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.insert_all(from..to);
         g.clean.insert_all(from..to);
+        if view_known() {
+            g.viewed.insert_all(from..to);
+        }
     };
     // Ahead of the protection (`PROTECTED`).
     (from..to).for_each(|block| PROTECTED.set(block));
@@ -2244,7 +2308,10 @@ static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 /// What the runtime holds while it changes what title memory shows
 /// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+pub struct Remapping {
+    _mapping: std::sync::RwLockWriteGuard<'static, ()>,
+    _scope: Option<scoped::Permit<'static>>,
+}
 
 impl Drop for Remapping {
     fn drop(&mut self) {
@@ -2386,11 +2453,32 @@ pub(crate) fn lost(what: &'static str, at: usize, len: usize) {
 }
 
 
+mod scoped;
+
+/// `VICTORY_TEXTURE_SCOPED_REMAP=1`: a texture refresh waits only for a
+/// remap of the views that hold its memory, not for any remap
+/// ([`scoped`]; off by default). A remap whose views are not known
+/// ([`title_memory_remapping`]) still waits for every read and holds off all.
+/// Every read, scoped or not, goes through [`scoped::GATE`] then; [`MAPPING`]
+/// only keeps the remaps one at a time.
+pub fn scoped_remap() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SCOPED_REMAP").is_some_and(|v| v == "1"))
+}
+
 /// The runtime is about to map, unmap or move physical pages of title
 /// memory: until what it returns is dropped, no read of title memory in
 /// place is under way and none begins ([`title_memory_reading`]). Taken
 /// around the whole change, the unmapping and the mapping again.
 pub fn title_memory_remapping() -> Remapping {
+    title_memory_remapping_in(|| None)
+}
+
+/// [`title_memory_remapping`] for a change that only touches `areas`: every
+/// whole view it can take away, with the runtime's page table held while
+/// they are worked out. With `VICTORY_TEXTURE_SCOPED_REMAP=1` only reads of
+/// memory there wait; `None` (not known) is all of it.
+pub fn title_memory_remapping_in(areas: impl FnOnce() -> Option<Vec<std::ops::Range<usize>>>) -> Remapping {
     // For the title's own threads ([`came_back`]).
     install();
     let met = MET.load(std::sync::atomic::Ordering::Relaxed);
@@ -2401,32 +2489,71 @@ pub fn title_memory_remapping() -> Remapping {
             tracing::info!(met, "accesses of title threads that waited for a change of mapping");
         }
     }
+    // Announced before waiting for the readers or the other changes.
+    let scope = scoped_remap().then(|| {
+        let areas = areas().filter(|a| !a.is_empty() && a.iter().all(|r| r.start < r.end)).unwrap_or_else(|| vec![scoped::ALL]);
+        scoped::GATE.write(areas)
+    });
     let changing = MAPPING.write().unwrap_or_else(|e| e.into_inner());
     CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     CHANGING.set((true, false));
-    Remapping(changing)
+    Remapping { _mapping: changing, _scope: scope }
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
-pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
+pub struct Reading {
+    _mapping: Option<std::sync::RwLockReadGuard<'static, ()>>,
+    _scope: Option<scoped::Permit<'static>>,
+}
 
 /// For reading title memory in place: until what it returns is dropped,
 /// the runtime changes no mapping, so memory found mapped stays mapped.
 /// Not to be taken twice by one thread, nor held across anything that
 /// maps title memory.
 pub fn title_memory_reading() -> Reading {
-    Reading(MAPPING.read().unwrap_or_else(|e| e.into_inner()))
+    if scoped_remap() {
+        return Reading { _mapping: None, _scope: scoped::GATE.read(scoped::ALL, true) };
+    }
+    Reading { _mapping: Some(MAPPING.read().unwrap_or_else(|e| e.into_inner())), _scope: None }
 }
 
 /// [`title_memory_reading`] if it can be had at once: `None` while the
 /// runtime changes a mapping (or waits to), for a caller that has another
 /// way to read and would rather not wait.
 pub fn title_memory_reading_now() -> Option<Reading> {
+    if scoped_remap() {
+        return scoped::GATE.read(scoped::ALL, false).map(|scope| Reading { _mapping: None, _scope: Some(scope) });
+    }
     match MAPPING.try_read() {
-        Ok(guard) => Some(Reading(guard)),
-        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(e.into_inner())),
+        Ok(guard) => Some(Reading { _mapping: Some(guard), _scope: None }),
+        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading { _mapping: Some(e.into_inner()), _scope: None }),
         Err(std::sync::TryLockError::WouldBlock) => None,
     }
+}
+
+/// The blocks `[start, end)` touches: a view is never smaller than a block.
+fn texture_area(start: usize, end: usize) -> std::ops::Range<usize> {
+    end.checked_next_multiple_of(BLOCK)
+        .map(|stop| (start / BLOCK * BLOCK)..stop)
+        .filter(|r| r.start < r.end)
+        .unwrap_or(scoped::ALL)
+}
+
+/// [`title_memory_reading`] for memory `[start, end)` alone: with
+/// `VICTORY_TEXTURE_SCOPED_REMAP=1` it waits for the remaps of its views only.
+pub(crate) fn texture_reading(start: usize, end: usize) -> Reading {
+    if scoped_remap() {
+        return Reading { _mapping: None, _scope: scoped::GATE.read(texture_area(start, end), true) };
+    }
+    title_memory_reading()
+}
+
+/// [`texture_reading`] if it can be had at once ([`title_memory_reading_now`]).
+pub(crate) fn texture_reading_now(start: usize, end: usize) -> Option<Reading> {
+    if scoped_remap() {
+        return scoped::GATE.read(texture_area(start, end), false).map(|scope| Reading { _mapping: None, _scope: Some(scope) });
+    }
+    title_memory_reading_now()
 }
 
 /// The runtime mapped title memory `[at, at + len)`: what it shows is new,
@@ -2441,7 +2568,12 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// write access is given back.
 pub fn title_memory_remapped(at: usize, len: usize) {
     crate::texback::remapped(at, len);
-    open(&mut title_memory_changed(at, len), at, at.saturating_add(len));
+    let mut g = title_memory_changed(at, len);
+    // A section's pages just mapped there: view memory ([`view_known`]).
+    if view_known() && len < 1 << 40 {
+        g.viewed.insert_all(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK));
+    }
+    open(&mut g, at, at.saturating_add(len));
 }
 
 /// The runtime is about to unmap title memory `[at, at + len)`: it is
@@ -2467,6 +2599,12 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
         PUBLISHED.clear(block);
         PROTECTED.clear(block);
     }
+    // A hole from now on, which may be given up and be other memory with no
+    // word of the runtime's: no longer known as a view ([`view_known`]).
+    let viewed: Vec<usize> = g.viewed.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).collect();
+    for block in viewed {
+        g.viewed.remove(block);
+    }
 }
 
 /// The title is about to free or decommit memory of its own,
@@ -2476,6 +2614,14 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 pub fn title_memory_freed(at: usize, len: usize) {
     let mut g = guards();
     let first = at / BLOCK;
+    if view_known() && g.viewed.range(first..).next().is_some() {
+        // Memory of the title's own, no view: known as one no longer.
+        let end = if len != 0 { at.saturating_add(len).div_ceil(BLOCK) } else { allocation_end(at, at).div_ceil(BLOCK).max(first + 1) };
+        let viewed: Vec<usize> = g.viewed.range(first..end).collect();
+        for block in viewed {
+            g.viewed.remove(block);
+        }
+    }
     let noted = [g.protected.range(first..).next(), g.absent.range(first..).next(), g.foreign.range(first..).next().copied()];
     let Some(noted) = noted.into_iter().flatten().min() else {
         return;
@@ -2853,6 +2999,62 @@ mod tests {
             VirtualQuery(at as *const _, &mut info, size_of_val(&info));
             info.Protect
         }
+    }
+
+    /// With `VICTORY_VIEW_KNOWN`: a view block once guarded stays known as
+    /// one after the title wrote it (its guard open), the write is still
+    /// seen, and the title freeing the memory forgets it. Off, nothing is
+    /// remembered.
+    #[test]
+    fn a_written_view_stays_known_until_freed() {
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile};
+        let map = || {
+            // SAFETY: a pagefile section of two blocks, mapped read-write.
+            let view = unsafe {
+                let section = CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, (2 * BLOCK) as u32, std::ptr::null());
+                assert!(!section.is_null());
+                MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK)
+            };
+            assert_ne!(view.Value as usize, 0);
+            view
+        };
+        // Off: guarded, nothing remembered.
+        let off = map();
+        let at = off.Value as usize;
+        assert!(writes(at, at + 2 * BLOCK, true).is_some());
+        assert!(!writable(at) && !guards().viewed.contains(at / BLOCK));
+        title_memory_unmapping(at, 2 * BLOCK);
+        // SAFETY: our view.
+        unsafe { UnmapViewOfFile(off) };
+
+        VIEW_KNOWN_HERE.set(true);
+        let view = map();
+        let at = view.Value as usize;
+        assert!(writes(at, at + 2 * BLOCK, true).is_some());
+        assert!(!writable(at) && guards().viewed.contains(at / BLOCK));
+        // The title writes the first block: its guard opens.
+        // SAFETY: our view; the guard's fault handler opens it.
+        unsafe { (at as *mut u8).write_volatile(7) };
+        {
+            let g = guards();
+            assert!(!g.protected.contains(at / BLOCK) && !g.absent.contains(at / BLOCK));
+            assert!(known_view_block(&g, at / BLOCK));
+        }
+        // Answered from the guards, the write seen.
+        let (now, found) = writes(at, at + BLOCK, true).expect("a view");
+        assert!(found.contains(&(at / PAGE, now)), "{found:?} at {now}");
+        title_memory_freed(at, 2 * BLOCK);
+        assert!(!guards().viewed.contains(at / BLOCK) && !guards().viewed.contains(at / BLOCK + 1));
+        // The runtime mapping pages there makes them known; unmapping them,
+        // a hole that may become other memory, forgets them.
+        title_memory_remapped(at, 2 * BLOCK);
+        assert!(guards().viewed.contains(at / BLOCK + 1));
+        title_memory_unmapping(at, 2 * BLOCK);
+        assert!(!guards().viewed.contains(at / BLOCK) && !guards().viewed.contains(at / BLOCK + 1));
+        VIEW_KNOWN_HERE.set(false);
+        title_memory_unmapping(at, 2 * BLOCK);
+        // SAFETY: our view.
+        unsafe { UnmapViewOfFile(view) };
     }
 
     /// A refresh between the opening of a kernel read's destination and the

@@ -2486,8 +2486,15 @@ impl HostHeap {
     /// caller's to make null when it has let go of its own slot's lock
     /// ([`HostHeap::unmake_stale`]).
     fn note_buffer(&self, index: u32, view: Option<&View>, seen: bool) -> Vec<(u32, u64)> {
+        self.note_buffer_marking(index, view, seen, true).0
+    }
+
+    /// [`HostHeap::note_buffer`]; `mark`: a buffer slot is marked for the
+    /// next heap buffer pass ([`HostHeap::buffer_changes`]). Also whether a
+    /// mark was left out.
+    fn note_buffer_marking(&self, index: u32, view: Option<&View>, seen: bool, mark: bool) -> (Vec<(u32, u64)>, bool) {
         if self.sampler {
-            return Vec::new();
+            return (Vec::new(), false);
         }
         // Measured for the texture side of the same gap (textures a shader
         // picks by a computed index are neither made, if placed, nor
@@ -2567,10 +2574,16 @@ impl HostHeap {
         } else {
             self.buffers.remove(index)
         };
-        if was {
+        if was && mark {
             self.changed.put(index);
         }
-        stale
+        (stale, was && !mark)
+    }
+
+    /// Title slot `index` is marked for the next heap buffer pass, as a
+    /// write of its buffer view marks it.
+    pub(crate) fn mark_buffer(&self, index: u32) {
+        self.changed.put(index);
     }
 
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
@@ -2726,7 +2739,7 @@ impl HostHeap {
     }
 
     /// What slot `index` views.
-    fn kept_in(&self, index: u32) -> Option<ID3D12Resource> {
+    pub(crate) fn kept_in(&self, index: u32) -> Option<ID3D12Resource> {
         self.kept.get(index as usize)?.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
@@ -3008,6 +3021,19 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        self.mirror_marking(index, handle, for_draw, None)
+    }
+
+    /// [`HostHeap::mirror`] for a draw, for the heap buffer pass itself
+    /// (`VICTORY_HEAP_PASS_UNMARKED`): a buffer slot it makes is not marked
+    /// for the next pass, which would only look at it again; `unmarked` is
+    /// set when a mark was left out.
+    pub(crate) fn mirror_unmarked(&self, index: u32, handle: u64, unmarked: &std::cell::Cell<bool>) -> Option<View> {
+        self.mirror_marking(index, handle, true, Some(unmarked))
+    }
+
+    /// [`HostHeap::mirror`]; with `unmarked`, as [`HostHeap::mirror_unmarked`].
+    fn mirror_marking(&self, index: u32, handle: u64, for_draw: bool, unmarked: Option<&std::cell::Cell<bool>>) -> Option<View> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -3059,7 +3085,10 @@ impl HostHeap {
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
             // (When this slot's lock is let go: a lock at a time.)
-            let stale = self.note_buffer(index, Some(&view), for_draw);
+            let (stale, left_out) = self.note_buffer_marking(index, Some(&view), for_draw, unmarked.is_none());
+            if left_out && let Some(unmarked) = unmarked {
+                unmarked.set(true);
+            }
             // A view of a texture object that has no host copy yet waits
             // for it, as buffer views wait for a draw: the slot is made
             // when the texture is first used (`super::make_waiting`), or
@@ -5366,6 +5395,28 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_eq!(view_kind(&uav(39, 0, 1)), 0, "raw");
         assert_eq!(view_kind(&uav(0, 16, 0)), 0, "structured");
         assert_eq!(view_stride(&uav(12, 0, 0)), Some(8));
+    }
+
+    /// The heap buffer pass making a buffer slot itself leaves no mark for
+    /// the next pass (`VICTORY_HEAP_PASS_UNMARKED`) and says so; a write
+    /// still marks it, and `mark_buffer` puts the mark back.
+    #[test]
+    fn a_buffer_slot_made_unmarked_is_not_looked_at_again() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        // Structured, 16-byte elements.
+        let view = View::Unordered(0, 0, Some([0, 1, 0, 0, 64, 16, 0, 0, 0, 0]));
+        heap.buffer_changes();
+        assert_eq!(heap.note_buffer_marking(2, Some(&view), false, true), (Vec::new(), false));
+        assert_eq!(heap.buffer_changes(), [2]);
+        assert_eq!(heap.note_buffer_marking(2, Some(&view), true, false), (Vec::new(), true));
+        assert_eq!(heap.buffer_changes(), [] as [u32; 0]);
+        heap.mark_buffer(2);
+        assert_eq!(heap.buffer_changes(), [2]);
+        // No buffer view there: no mark to leave out.
+        assert_eq!(heap.note_buffer_marking(3, None, false, false), (Vec::new(), false));
+        assert_eq!(heap.buffer_changes(), [] as [u32; 0]);
     }
 
     /// What may stand for a texture that is not there yet: one of its kind in
