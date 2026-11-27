@@ -1081,7 +1081,7 @@ mod tests {
     /// The driver's version reads as the vendor's tools show it.
     #[test]
     fn driver_version_reads_as_four_parts() {
-        let v = (32_i64 << 48) | (0_i64 << 32) | (16_i64 << 16) | 1088;
+        let v = (32_i64 << 48) | (16_i64 << 16) | 1088;
         assert_eq!(super::driver_version(v), "32.0.16.1088");
         assert_eq!(super::driver_version(0), "0.0.0.0");
     }
