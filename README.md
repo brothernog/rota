@@ -28,7 +28,7 @@ back end that recompiles the console's GPU programs (GFX10/RDNA2) to DXIL.
 
 | | Cards | System memory | Status |
 |---|---|---|---|
-| **Tested** | RTX 3050 8 GB | 32 GB | playable, ~4.5 fps |
+| **Tested** | RTX 3050 8 GB | 32 GB | playable, ~9.5 fps |
 | **Target** | RTX 3060, RTX 2070, other 6–8 GB cards | 16–32 GB | not measured yet |
 | **Not a goal** | features that only the newest cards have | | |
 
@@ -39,31 +39,39 @@ and the card) and **no new-card features**: nothing here needs the newest GPUs o
 ## Where it is
 
 **Playable, slowly.** On the RTX 3050 the title boots, takes input and runs through the first
-mission without crashing so far, at about **4.5 fps** in the first playable area (1080p, Series S
-profile, `diag` build; the best measured run had a median of 4.6 fps, and 10% of its time was
-under 2.8 fps).
+mission without crashing so far, at about **9.5 fps** from the opening cutscene through the first
+playable area (1080p, Series S profile, `diag` build, the default settings below; the best
+measured run had a median of 9.6 fps, and 10% of its time was under 4.1 fps).
 
-The first round of measurements, one setting changed at a time:
+How the median got there, one change at a time (each bar adds to the one before it):
 
 ```mermaid
 xychart-beta
-    title "Median fps in the first playable area (RTX 3050 8 GB)"
-    x-axis ["Texture cap 3072 MB", "No texture cap (now)", "Texture levels on demand"]
-    y-axis "fps" 0 --> 6
-    bar [3.35, 4.6, 2.6]
+    title "Median fps, opening cutscene and first playable area (RTX 3050 8 GB)"
+    x-axis ["Texture cap 3072 MB", "No texture cap", "Card steps, slots, 6 workers", "Small buffers on the card (now)"]
+    y-axis "fps" 0 --> 10
+    bar [3.35, 4.6, 7.2, 9.6]
 ```
 
-Where the time of one frame goes in the best run (218 ms a frame). The card is now the larger
-share, and memory is full: 31.4 of 32 GB of system memory in use, and up to 6.75 GB of video
-memory spilled into PC memory.
+Rendering at half the size (`VICTORY_RENDER_SCALE=0.5`) gives nothing on top of this (6.8 against
+7.2 fps: the frame is the CPU's, not the card's) and breaks the picture (white glare, colored
+blotches, checkered textures), so it is off.
+
+Where the time of one frame goes in the best run (104 ms a frame). The parts overlap (the
+copy-back runs on its own thread beside the preparing), so they do not add up to the frame.
 
 ```mermaid
 xychart-beta
     title "One frame, best run (ms)"
     x-axis ["CPU preparing", "Waiting for the GPU", "Copying back"]
-    y-axis "ms" 0 --> 120
-    bar [77, 110, 61]
+    y-axis "ms" 0 --> 80
+    bar [62, 26, 66]
 ```
+
+> [!NOTE]
+> The default settings trade some picture for speed: shadows look softer, a little washed out,
+> with card steps on (`VICTORY_CARD_STEPS=0` gives the exact ones, at a much lower frame rate),
+> and a texture can show green now and then. Both are being worked on.
 
 ## What this fork adds
 
@@ -75,8 +83,9 @@ xychart-beta
 - **Numbers you can share.** `VICTORY_OVERLAY_CSV=<file>` writes the overlay's numbers once a
   second, and [`scripts/overlay-summary.ps1`](scripts/overlay-summary.ps1) turns a run into one
   line of medians and peaks, ready for an issue.
-- **Measured defaults for 8 GB cards**: no texture budget cap (`VICTORY_TEXTURE_BUDGET_MB`
-  unset) and `VICTORY_MEMORY_MAP=0`.
+- **Measured defaults for 8 GB cards**, applied by `victory.exe` itself when you have not set
+  them (see [Build and run](#build-and-run)); `VICTORY_TUNED=0` turns them all off. No texture
+  budget cap (`VICTORY_TEXTURE_BUDGET_MB` unset).
 
 Inherited from the forks it starts from, and kept on:
 
@@ -107,14 +116,19 @@ by a run with `VICTORY_PIPELINE_BOOK=1`. So the first run is cold (dropped draws
 picture), then warm, then run again. The warm-up's bookkeeping is kept per card, so after
 switching cards `warm --used` makes that card's pipelines on its own.
 
-The settings the numbers above were measured with:
+The settings the numbers above were measured with are the defaults: `victory.exe` sets each one
+you have not set yourself, for `shaders`, `warm` and `run` alike (it prints which), and
+`VICTORY_TUNED=0` sets none. They are listed in [`apps/victory/src/tuned.rs`](apps/victory/src/tuned.rs):
 
-```powershell
-$env:VICTORY_RT_MISS = '1'; $env:VICTORY_RELAY = '2'; $env:VICTORY_THIN = '0'
-$env:VICTORY_DISPLAY_MODE = '1920x1080'; $env:VICTORY_PIPELINE_BOOK = '1'
-$env:VICTORY_MEMORY_CARD_MB = '1024'; $env:VICTORY_UPSCALER = '6'
-$env:VICTORY_MEMORY_MAP = '0'
+```text
+VICTORY_RT_MISS=1  VICTORY_RELAY=2  VICTORY_THIN=0  VICTORY_PIPELINE_BOOK=1
+VICTORY_MEMORY_CARD_MB=1024  VICTORY_UPSCALER=6  VICTORY_MEMORY_MAP=0
+VICTORY_CARD_STEPS=1  VICTORY_CARD_ALL=1  VICTORY_DYNAMIC_SLOTS=499999  VICTORY_PIPELINE_WORKERS=6
 ```
+
+The numbers were also taken with `$env:VICTORY_DISPLAY_MODE = '1920x1080'`. To change one, set the
+variable before running (for example `$env:VICTORY_CARD_STEPS = '0'`), and give `warm` and `run`
+the same settings. `VICTORY_PIPELINE_WORKERS=6` suits an 8-core CPU; on fewer cores try fewer.
 
 > [!TIP]
 > Warm with the same settings as the run. A rebuild that does not change the shader translator
