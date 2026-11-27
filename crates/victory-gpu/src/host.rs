@@ -2099,12 +2099,19 @@ void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
     if (compare != 0u) {
         // The flag, and above it 31 bits of the hash (`torn`).
         uint folded = h.x ^ (h.y * 3u) ^ (h.z * 5u) ^ (h.w * 7u);
+#ifdef CARD_RING
+        // Read once: another pass at the piece may store its hash between
+        // two reads, and the flag and the slot would disagree.
+        bool differed = any(h != hashes.Load4(piece * 16u));
+        differs.Store(out_at + id.x * 4u, (folded << 1u) | (differed ? 1u : 0u));
+#else
         differs.Store(out_at + id.x * 4u, (folded << 1u) | (any(h != hashes.Load4(piece * 16u)) ? 1u : 0u));
+#endif
         // With the copy-back on its own thread: the next compare of the
         // piece finds what is written from here on.
 #ifdef CARD_RING
         if (compare == 3u) {
-            if (any(h != hashes.Load4(piece * 16u))) {
+            if (differed) {
                 uint s;
                 counter.InterlockedAdd(0, 1u, s);
                 s &= 0x7FFFFFFFu;
@@ -3784,16 +3791,18 @@ fn late_line(frames: f64) {
             );
         }
         if ring::mode() != 0 {
-            let t: Vec<f64> = ring::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+            // (Did not fit, and not what the compare hashed: counts, not per frame, so that one shows.)
+            let n: Vec<u64> = ring::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed)).collect();
+            let t: Vec<f64> = n.iter().map(|&n| n as f64 / frames).collect();
             tracing::info!(
                 "card ring per frame (VICTORY_CARD_RING=3, the shadow: landing still fetches): {:.1} pieces, {:.1} MB in the ring; \
-                 {:.2} did not fit; {:.2} not what the compare hashed (0 expected); {:.1} fetched parts looked for in the ring, \
-                 {:.2} of them not as the ring has them (the fetch runs later, a later flight's bytes may be in it); \
-                 compares with the ring {:.2} ms on the card ({:.1} timed)",
+                 {} pieces did not fit and {} were not what the compare hashed (0 expected) since the last line; \
+                 {:.1} fetched parts looked for in the ring, {:.2} of them not as the ring has them (the fetch runs later, \
+                 a later flight's bytes may be in it); compares with the ring {:.2} ms on the card ({:.1} timed)",
                 t[0],
                 t[1] / (1 << 20) as f64,
-                t[2],
-                t[3],
+                n[2],
+                n[3],
                 t[4],
                 t[5],
                 t[6] / 1e6,
@@ -4388,8 +4397,10 @@ impl Host {
         const RESULTS: u64 = 1 << 20;
         let (differs, data) = self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
         name(&differs, || "card compare results".into());
+        // (Only flights of the relay use it.)
         let ring = match ring::mode() {
             0 => None,
+            _ if !relay() => None,
             _ => self
                 .make_card_ring()
                 .inspect_err(|e| tracing::warn!(error = %e, "no card ring (VICTORY_CARD_RING): it could not be made"))
