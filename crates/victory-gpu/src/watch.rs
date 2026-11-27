@@ -2614,6 +2614,8 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::framelog::title_memory_gone(at, len);
     let mut g = guards();
     let first = at / BLOCK;
     if view_known() && g.viewed.range(first..).next().is_some() {

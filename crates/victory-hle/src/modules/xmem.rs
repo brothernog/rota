@@ -198,6 +198,9 @@ pub extern "system" fn XMemVirtualAlloc(
         LOW_RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).push((at as usize, size));
     }
     note_protection(asked, kind, flags, at as usize, size);
+    if !at.is_null() {
+        victory_gpu::framelog::title_memory_kind(at as usize, size, asked & 0x400 != 0);
+    }
     at
 }
 

@@ -29,6 +29,8 @@ COUNTERS = [
     'guard_waits', 'guard_wait_ms', 'guard_faults', 'page_faults', 'process_cpu_ms',
     'frame_wait_title_ms', 'frame_wait_fence_ms', 'frame_wait_timer_ms', 'frame_wait_other_ms',
     'ds_pending_ms', 'unknown_ds_pending_ms',
+    'list_lock_ms', 'page_reads', 'pages_input',
+    'up_wc_bytes', 'up_other_bytes', 'back_compared_wc_bytes', 'back_compared_other_bytes', 'back_wc_bytes', 'back_other_bytes',
 ]
 SLOW, FAST, AROUND, LEAST_MS = 1.5, 0.67, 5.0, 40.0
 
@@ -139,6 +141,15 @@ def describe(rows, idx, medians):
             f"unexplained {100 * total['unexplained'] / wall:.1f}%, unknown {100 * sum(total[b] for b in UNKNOWN) / wall:.1f}%")
     if ratios:
         text += '; above the run: ' + ', '.join(f"{c} {per:.1f}/frame (median {base:.1f})" for _, c, per, base in ratios[:4])
+    sites = {}
+    for i in idx:
+        for k in (1, 2, 3):
+            line = int(rows[i].get(f'list_top{k}_line') or 0)
+            if line:
+                sites[line] = sites.get(line, 0.0) + (rows[i].get(f'list_top{k}_ms') or 0.0)
+    if sites:
+        top = sorted(sites.items(), key=lambda s: -s[1])[:2]
+        text += '; list calls: ' + ', '.join(f'list.rs:{line} {ms / n:.0f} ms/frame' for line, ms in top)
     return text
 
 

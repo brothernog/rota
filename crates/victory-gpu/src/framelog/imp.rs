@@ -229,10 +229,21 @@ pub(crate) enum K {
     FrameWaitFenceNs,
     FrameWaitTimerNs,
     FrameWaitOtherNs,
+    /// Bytes copied from title memory up to the card's copies, and bytes of
+    /// the copy-back (compared after a submission; put into title memory),
+    /// split by whether the title allocated that memory write-combined.
+    UpWcBytes,
+    UpOtherBytes,
+    BackComparedWcBytes,
+    BackComparedOtherBytes,
+    BackWcBytes,
+    BackOtherBytes,
+    /// Waiting for a title list's state lock in list calls.
+    ListLockNs,
     SlotsFull,
 }
 
-const NAMES: [&str; 32] = [
+const NAMES: [&str; 39] = [
     "xmem_title_calls",
     "xmem_title_pages",
     "xmem_title_ns",
@@ -264,6 +275,13 @@ const NAMES: [&str; 32] = [
     "frame_wait_fence_ns",
     "frame_wait_timer_ns",
     "frame_wait_other_ns",
+    "up_wc_bytes",
+    "up_other_bytes",
+    "back_compared_wc_bytes",
+    "back_compared_other_bytes",
+    "back_wc_bytes",
+    "back_other_bytes",
+    "list_lock_ns",
     "slots_full",
 ];
 const _: () = assert!(NAMES.len() == K::SlotsFull as usize + 1);
@@ -409,6 +427,176 @@ pub fn dstorage(bytes: u64, title_ns: u64, queue_ns: u64, service_ns: u64) {
     count(K::DsTitleNs, title_ns);
     count(K::DsQueueNs, queue_ns);
     count(K::DsServiceNs, service_ns);
+}
+
+/// The title memory allocated write-combined (protection bit 0x400): start
+/// to end, not overlapping.
+static WC: std::sync::RwLock<std::collections::BTreeMap<usize, usize>> = std::sync::RwLock::new(std::collections::BTreeMap::new());
+
+/// Leaves `[at, end)` out of the write-combined ranges.
+fn cut(map: &mut std::collections::BTreeMap<usize, usize>, at: usize, end: usize) {
+    let hit: Vec<(usize, usize)> = map.range(..end).rev().take_while(|&(_, &e)| e > at).map(|(&s, &e)| (s, e)).collect();
+    for (s, e) in hit {
+        map.remove(&s);
+        if s < at {
+            map.insert(s, at);
+        }
+        if e > end {
+            map.insert(end, e);
+        }
+    }
+}
+
+/// The title allocated `[at, at + len)`, write-combined or not.
+pub fn title_memory_kind(at: usize, len: usize, write_combined: bool) {
+    if !on() || len == 0 {
+        return;
+    }
+    let mut map = WC.write().unwrap_or_else(|e| e.into_inner());
+    cut(&mut map, at, at.saturating_add(len));
+    if write_combined {
+        map.insert(at, at.saturating_add(len));
+    }
+}
+
+/// The title freed `[at, at + len)` (`len` 0: the allocation at `at`).
+pub(crate) fn title_memory_gone(at: usize, len: usize) {
+    if !on() {
+        return;
+    }
+    let mut map = WC.write().unwrap_or_else(|e| e.into_inner());
+    if len == 0 {
+        map.remove(&at);
+    } else {
+        cut(&mut map, at, at.saturating_add(len));
+    }
+}
+
+/// The bytes of `[at, end)` the title allocated write-combined.
+fn wc_bytes(map: &std::collections::BTreeMap<usize, usize>, at: usize, end: usize) -> usize {
+    map.range(..end).rev().take_while(|&(_, &e)| e > at).map(|(&s, &e)| e.min(end) - s.max(at)).sum()
+}
+
+/// Which way a copy of title memory goes.
+#[derive(Clone, Copy)]
+pub(crate) enum Copied {
+    Up,
+    BackCompared,
+    Back,
+}
+
+/// `bytes` were copied for the title memory `[at, at + len)`.
+///
+/// shortcut: a copy of part of the range (pages the write watch found) is
+/// split in proportion to the range's write-combined bytes, which is exact
+/// while a range lies in one allocation, as a buffer's does.
+pub(crate) fn copied(way: Copied, at: usize, len: usize, bytes: u64) {
+    if !on() || len == 0 || bytes == 0 {
+        return;
+    }
+    let wc = wc_bytes(&WC.read().unwrap_or_else(|e| e.into_inner()), at, at.saturating_add(len)) as u64;
+    let wc = (bytes as u128 * wc as u128 / len as u128) as u64;
+    let (w, o) = match way {
+        Copied::Up => (K::UpWcBytes, K::UpOtherBytes),
+        Copied::BackCompared => (K::BackComparedWcBytes, K::BackComparedOtherBytes),
+        Copied::Back => (K::BackWcBytes, K::BackOtherBytes),
+    };
+    count(w, wc);
+    count(o, bytes - wc);
+}
+
+/// List calls by where in `list.rs` they come from (a line; 0: free),
+/// with their calls and nanoseconds. Lines are few (one per method).
+const SITES: usize = 128;
+static SITE_LINE: [AtomicU32; SITES] = [const { AtomicU32::new(0) }; SITES];
+static SITE_CALLS: [AtomicU64; SITES] = [const { AtomicU64::new(0) }; SITES];
+static SITE_NS: [AtomicU64; SITES] = [const { AtomicU64::new(0) }; SITES];
+
+/// A list call from `line` of `list.rs` took `ns`, `lock_ns` of them
+/// waiting for the list's state.
+pub(crate) fn list_call(line: u32, ns: u64, lock_ns: u64) {
+    if !on() {
+        return;
+    }
+    count(K::ListLockNs, lock_ns);
+    let mut i = line as usize % SITES;
+    for _ in 0..SITES {
+        let held = SITE_LINE[i].load(Relaxed);
+        let mine = held == line
+            || (held == 0
+                && match SITE_LINE[i].compare_exchange(0, line, Relaxed, Relaxed) {
+                    Ok(_) => true,
+                    Err(now) => now == line,
+                });
+        if mine {
+            SITE_CALLS[i].fetch_add(1, Relaxed);
+            SITE_NS[i].fetch_add(ns, Relaxed);
+            return;
+        }
+        i = (i + 1) % SITES;
+    }
+}
+
+/// The process's working set and private bytes, and the memory the system
+/// has available (MB).
+fn memory_mb() -> (u64, u64, u64) {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX};
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut c = PROCESS_MEMORY_COUNTERS_EX { cb: size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32, ..Default::default() };
+    let mut m = MEMORYSTATUSEX { dwLength: size_of::<MEMORYSTATUSEX>() as u32, ..Default::default() };
+    // SAFETY: our own process and sized structures.
+    unsafe {
+        K32GetProcessMemoryInfo(GetCurrentProcess(), (&raw mut c).cast::<PROCESS_MEMORY_COUNTERS>(), c.cb);
+        GlobalMemoryStatusEx(&mut m);
+    }
+    (c.WorkingSetSize as u64 >> 20, c.PrivateUsage as u64 >> 20, m.ullAvailPhys >> 20)
+}
+
+/// The system's reads from disk for page faults, as counts so far: the
+/// reads and the pages they brought in (PDH, `\Memory\Page Reads/sec` and
+/// `\Memory\Pages Input/sec` raw).
+struct PageReads(*mut std::ffi::c_void, [*mut std::ffi::c_void; 2]);
+
+impl PageReads {
+    fn new() -> Option<PageReads> {
+        use windows_sys::Win32::System::Performance::{PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData, PdhOpenQueryW};
+        let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+        let (mut query, mut counters) = (std::ptr::null_mut(), [std::ptr::null_mut(); 2]);
+        // SAFETY: out handles and NUL-terminated paths.
+        unsafe {
+            if PdhOpenQueryW(std::ptr::null(), 0, &mut query) != 0 {
+                return None;
+            }
+            for (path, counter) in [r"\Memory\Page Reads/sec", r"\Memory\Pages Input/sec"].into_iter().zip(&mut counters) {
+                if PdhAddEnglishCounterW(query, wide(path).as_ptr(), 0, counter) != 0 {
+                    PdhCloseQuery(query);
+                    return None;
+                }
+            }
+            PdhCollectQueryData(query);
+        }
+        Some(PageReads(query, counters))
+    }
+
+    /// Reads and pages so far.
+    fn read(&self) -> (u64, u64) {
+        use windows_sys::Win32::System::Performance::{PDH_RAW_COUNTER, PdhCollectQueryData, PdhGetRawCounterValue};
+        let mut out = [0u64; 2];
+        // SAFETY: our query and counters, and sized out values.
+        unsafe {
+            if PdhCollectQueryData(self.0) != 0 {
+                return (0, 0);
+            }
+            for (counter, out) in self.1.iter().zip(&mut out) {
+                let mut raw = PDH_RAW_COUNTER::default();
+                if PdhGetRawCounterValue(*counter, std::ptr::null_mut(), &mut raw) == 0 {
+                    *out = raw.FirstValue as u64;
+                }
+            }
+        }
+        (out[0], out[1])
+    }
 }
 
 /// The events fences of ours set for the title.
@@ -728,6 +916,10 @@ pub(crate) fn header() -> String {
     h.push_str(
         ",pipelines_made,pipelines_loaded,pipelines_making,textures_waiting,process_cpu_ms,page_faults,ticks,tick_max_ms",
     );
+    h.push_str(",working_set_mb,private_mb,available_mb,page_reads,pages_input");
+    for i in 1..=TOP {
+        let _ = std::fmt::Write::write_fmt(&mut h, format_args!(",list_top{i}_line,list_top{i}_ms,list_top{i}_calls"));
+    }
     h
 }
 
@@ -741,7 +933,14 @@ struct Looker {
     thread: (u32, isize, u64),
     /// Processor cycles a microsecond.
     cycles_per_us: f64,
+    page_reads: Option<PageReads>,
+    reads: (u64, u64),
+    /// List calls by site so far: calls, nanoseconds.
+    sites: [(u64, u64); SITES],
 }
+
+/// List call sites named per line, the slowest of the frame first.
+const TOP: usize = 3;
 
 fn ms(us: u64) -> String {
     format!("{:.2}", us as f64 / 1e3)
@@ -846,6 +1045,28 @@ impl Looker {
         );
         self.pipelines = (made, loaded);
         (self.cpu, self.faults) = (cpu, faults);
+        let (working, private, available) = memory_mb();
+        let reads = self.page_reads.as_ref().map_or((0, 0), PageReads::read);
+        let _ = write!(
+            row,
+            ",{working},{private},{available},{},{}",
+            reads.0 - self.reads.0.min(reads.0),
+            reads.1 - self.reads.1.min(reads.1)
+        );
+        self.reads = reads;
+        let mut sites: Vec<(u64, u64, u32)> = (0..SITES)
+            .filter_map(|i| {
+                let line = SITE_LINE[i].load(Relaxed);
+                let now = (SITE_CALLS[i].load(Relaxed), SITE_NS[i].load(Relaxed));
+                let was = std::mem::replace(&mut self.sites[i], now);
+                (line != 0 && now.1 > was.1).then(|| (now.1 - was.1, now.0 - was.0.min(now.0), line))
+            })
+            .collect();
+        sites.sort_unstable_by_key(|s| std::cmp::Reverse(s.0));
+        for i in 0..TOP {
+            let (ns, calls, line) = sites.get(i).copied().unwrap_or((0, 0, 0));
+            let _ = write!(row, ",{line},{:.2},{calls}", ns as f64 / 1e6);
+        }
         row
     }
 }
@@ -921,7 +1142,11 @@ fn look(file: std::fs::File) {
         faults: crate::copystat::page_faults(),
         thread: (0, 0, 0),
         cycles_per_us: cycles_per_us(),
+        page_reads: PageReads::new(),
+        reads: (0, 0),
+        sites: [(0, 0); SITES],
     };
+    looker.reads = looker.page_reads.as_ref().map_or((0, 0), PageReads::read);
     let mut last = now_us();
     let mut frame = Frame::new(PRESENTS.load(Acquire), last, 0);
     let (mut cpu, mut ticks, mut longest) = (0u64, 0u64, 0u64);
@@ -1053,11 +1278,23 @@ mod tests {
         assert_eq!((f.pre_list, f.xmem), (750, 1_000));
     }
 
+    /// Write-combined ranges are cut by later allocations and frees, and
+    /// a copy is split by its write-combined bytes.
+    #[test]
+    fn write_combined_ranges() {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(100, 200);
+        map.insert(300, 400);
+        assert_eq!(wc_bytes(&map, 150, 350), 50 + 50);
+        cut(&mut map, 120, 330);
+        assert_eq!(map.into_iter().collect::<Vec<_>>(), vec![(100, 120), (330, 400)]);
+    }
+
     /// The header has a name for every number of a line.
     #[test]
     fn the_header_names_every_column() {
         let h = header();
-        assert_eq!(h.split(',').count(), 4 + BUCKETS.len() + 5 + NAMES.len() + 8);
+        assert_eq!(h.split(',').count(), 4 + BUCKETS.len() + 5 + NAMES.len() + 8 + 5 + 3 * TOP);
         assert!(h.contains(",xmem_title_ms,") && h.contains(",unexplained,") && !h.contains("_ns"));
     }
 }

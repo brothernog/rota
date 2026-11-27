@@ -22,10 +22,10 @@
 mod imp;
 
 #[cfg(all(windows, feature = "diagnostics"))]
-pub use imp::{Reading, Xmem, XmemCall, ds_pending, dstorage, on, reading, xmem};
+pub use imp::{Reading, Xmem, XmemCall, ds_pending, dstorage, on, reading, title_memory_kind, xmem};
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) use imp::{
-    BY_FENCE, BY_TITLE, K, Phase, State, count, enter, fence_event, phase, presented, presenting, relay, title_wait, waiting_guards, woke,
+    BY_FENCE, BY_TITLE, Copied, K, Phase, State, count, enter, fence_event, phase, presented, presenting, relay, list_call, title_memory_gone, title_wait, waiting_guards, woke, copied,
     waiting_pipeline,
 };
 
@@ -74,6 +74,11 @@ pub struct Reading;
 pub fn reading() -> Reading {
     Reading
 }
+
+/// The title allocated `[at, at + len)`, write-combined or not.
+#[cfg(not(all(windows, feature = "diagnostics")))]
+#[inline(always)]
+pub fn title_memory_kind(_at: usize, _len: usize, _write_combined: bool) {}
 
 /// `n` DirectStorage reads are submitted and not done.
 #[cfg(not(all(windows, feature = "diagnostics")))]

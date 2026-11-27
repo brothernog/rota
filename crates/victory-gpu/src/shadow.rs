@@ -2223,6 +2223,8 @@ fn under_wide() -> bool {
 /// where the old race is left.
 fn put_changed(at: usize, title: &[u8], merged: &[u8]) -> usize {
     crate::watch::landing(at, title.len());
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::framelog::copied(crate::framelog::Copied::Back, at, title.len(), title.len() as u64);
     #[cfg(feature = "diagnostics")]
     if crate::host::census::on() {
         crate::host::census::put(at, title.len());
@@ -3265,6 +3267,8 @@ impl Shadow {
     fn compared(&self, from: usize, to: usize) {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::BackCompared, (to - from) as u64);
+        #[cfg(all(windows, feature = "diagnostics"))]
+        crate::framelog::copied(crate::framelog::Copied::BackCompared, self.start as usize + from, to - from, (to - from) as u64);
         let (bytes, ranges) = if self.window { (2, 5) } else { (3, 6) };
         BACK_CLASS[bytes].fetch_add((to - from) as u64, Ordering::Relaxed);
         BACK_CLASS[ranges].fetch_add(1, Ordering::Relaxed);
@@ -3810,6 +3814,8 @@ impl Shadow {
                 let guarded = crate::watch::guarded(from, to) || self.watched.load(Ordering::Relaxed) == GUARDED;
                 self.watched.store(if guarded { GUARDED } else { 1 }, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written);
+                #[cfg(all(windows, feature = "diagnostics"))]
+                crate::framelog::copied(crate::framelog::Copied::Up, from, to - from, copied as u64);
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
                 {
@@ -3828,6 +3834,8 @@ impl Shadow {
         self.copy(from, to);
         #[cfg(feature = "diagnostics")]
         crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);
+        #[cfg(all(windows, feature = "diagnostics"))]
+        crate::framelog::copied(crate::framelog::Copied::Up, from, to - from, (to - from) as u64);
         to - from
     }
 
