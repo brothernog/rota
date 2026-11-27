@@ -4276,8 +4276,9 @@ struct FreshTable {
 }
 
 /// Whether the tables of a list that hold constant buffers are made afresh in
-/// each part when the list is cut at a wait (`VICTORY_CUT_TABLES`; on by
-/// default with `VICTORY_CARD_STEPS`, else off; `0`/`1` to choose).
+/// each part when the list is cut at a wait (`VICTORY_CUT_TABLES=1`; off by
+/// default: with it on, CARD_STEPS's picture stayed spoilt in run
+/// STEP_CHECK=1 of 2026-11-26, and it costs dynamic slots).
 ///
 /// Such a table's constants are copied at the submission of the host list
 /// that made it, and a later part's draws that read the same table read that
@@ -4290,11 +4291,7 @@ struct FreshTable {
 /// reset. Costs dynamic slots: each part makes its own tables.
 fn cut_tables() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| match std::env::var("VICTORY_CUT_TABLES").ok().as_deref() {
-        Some("1") => true,
-        Some("0") => false,
-        _ => std::env::var("VICTORY_CARD_STEPS").is_ok_and(|v| v == "1" || v == "2"),
-    })
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CUT_TABLES").is_some_and(|v| v == "1"))
 }
 
 /// Since the last frame-rate line: tables with constants dropped at a cut,

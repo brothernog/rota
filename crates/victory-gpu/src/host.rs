@@ -3669,10 +3669,11 @@ fn late_line(frames: f64) {
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
     if late_exact() {
-        let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
+        let [pages, runs, bytes, wrote, held] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
         tracing::info!(
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
-             {runs:.0} changed runs, {:.2} MB",
+             {runs:.0} changed runs, {:.2} MB; {wrote:.0} of the runs on pages shaders' writes landed in lately, {held:.2} \
+             ranges left to the wait for that (VICTORY_MERGE_GUARD)",
             bytes / (1 << 20) as f64
         );
     }
