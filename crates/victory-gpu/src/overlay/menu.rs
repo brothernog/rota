@@ -245,7 +245,17 @@ fn render(frame_h: usize) -> Option<(Bitmap, Vec<(i32, i32, u32)>)> {
 
 #[cfg(test)]
 mod tests {
-    use super::hit;
+    use super::{hit, render};
+
+    #[test]
+    fn the_panel_holds_every_switch_row() {
+        for frame_h in [720, 1080, 2160] {
+            let (bm, rows) = render(frame_h).expect("a panel");
+            assert_eq!(rows.len(), crate::ab::MENU.len());
+            assert!(rows.windows(2).all(|r| r[0].1 <= r[1].0), "rows overlap at {frame_h}");
+            assert!(rows.last().unwrap().1 < bm.h as i32, "last row outside the panel at {frame_h}");
+        }
+    }
 
     #[test]
     fn a_click_finds_the_row_under_it() {
