@@ -1,0 +1,306 @@
+"""Rota panel: live dashboard that follows the newest run csv and its log.
+
+Run: python -I tools/rota-profiler/panel.py [--file <csv>]
+Check: python -I tools/rota-profiler/panel.py --selftest <csv>
+"""
+import argparse
+import csv
+import glob
+import io
+import os
+import re
+import sys
+import time
+
+LOGS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "local", "logs")
+WINDOW_S = 180
+MAX_LINES = 500
+
+
+def rgb(r, g, b):
+    return "#%02x%02x%02x" % (r, g, b)
+
+
+BG, DIM, DIMMER = rgb(12, 13, 16), rgb(140, 146, 158), rgb(104, 110, 122)
+WHITE, RED, GREEN, YELLOW = rgb(240, 242, 246), rgb(255, 98, 88), rgb(96, 220, 130), rgb(250, 204, 70)
+CYAN, BLUE = rgb(80, 200, 230), rgb(120, 150, 255)
+CARD = rgb(20, 22, 27)
+
+KEEP_WHITE = ("all made", "library", "cutscene", "named by the submissions")
+PREFIX = re.compile(r"^\W*\d{4}-\d\d-\d\dT[\d:.]+Z\s+")
+
+
+def newest_csv(after=0.0):
+    files = [f for f in glob.glob(os.path.join(LOGS, "run-*.csv")) if not f.endswith(".frames.csv")]
+    files = [f for f in files if os.path.getmtime(f) >= after]
+    return max(files, key=os.path.getmtime) if files else None
+
+
+class Tail:
+    """Reads new bytes from an offset; keeps a partial last line for the next call."""
+
+    def __init__(self, path):
+        self.path, self.off, self.rest = path, 0, b""
+
+    def read(self):
+        try:
+            with open(self.path, "rb") as f:
+                f.seek(self.off)
+                data = f.read()
+        except OSError:
+            return []
+        self.off += len(data)
+        data = self.rest + data
+        *lines, self.rest = data.split(b"\n")
+        return [l.decode("utf-8", errors="replace").rstrip("\r") for l in lines]
+
+
+def num(s):
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return float("nan")  # empty or garbage cell: missing
+
+
+class Csv:
+    def __init__(self, path):
+        self.tail, self.header, self.cols = Tail(path), None, {}
+
+    def update(self):
+        for line in self.tail.read():
+            if not line.strip():
+                continue
+            row = next(csv.reader(io.StringIO(line)))
+            if self.header is None or row[0] == "t_s":
+                self.header = row
+                self.cols = {k: [] for k in row}
+                continue
+            if len(row) < len(self.header):
+                row += [""] * (len(self.header) - len(row))
+            for k, v in zip(self.header, row):
+                self.cols[k].append(num(v))
+
+    def last(self, key):
+        v = self.cols.get(key) or []
+        return v[-1] if v else float("nan")
+
+
+LEVEL_MODULE = re.compile(r"^\s*(?:INFO|WARN|ERROR|DEBUG)\s+[\w:]+:\s*")
+ANSI = re.compile(r"\x1b\[[0-9;]*m")  # an interactive run logs in color
+
+
+def short_line(line):
+    # the level shows as the color, the module path only eats width
+    return LEVEL_MODULE.sub("", PREFIX.sub("", ANSI.sub("", line)))
+
+
+def top(vals, floor):
+    ok = [v for v in vals if v == v]
+    return max([floor] + [v * 1.1 for v in ok])
+
+
+def line_color(line):
+    low = ANSI.sub("", line).lower()
+    if any(k in low for k in KEEP_WHITE):
+        return "white"
+    if " error " in low or low.startswith("error"):
+        return "red"
+    if " warn " in low or low.startswith("warn"):
+        return "yellow"
+    return "dim"
+
+
+def fmt(v, spec="%.1f", unit=""):
+    return "--" if v != v else (spec % v) + unit
+
+
+def fps_color(v):
+    if v != v:
+        return DIM
+    return RED if v < 5 else YELLOW if v < 10 else GREEN
+
+
+def selftest(path):
+    c = Csv(path)
+    c.update()
+    log = Tail(os.path.splitext(path)[0] + ".log")
+    n_log = len(log.read())
+    print("rows=%d last_fps=%s log_lines=%d" % (len(c.cols.get("t_s", [])), fmt(c.last("fps"), "%.2f"), n_log))
+
+
+def run_ui(path_arg):
+    import tkinter as tk
+    from tkinter import font as tkfont
+    import matplotlib
+    matplotlib.use("TkAgg")
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+    started = time.time()
+    root = tk.Tk()
+    root.geometry("980x560")
+    root.configure(bg=BG)
+    # the run's name is in the title from the start: a launcher closes its own panel by it
+    root.title("Rota panel — " + (os.path.basename(path_arg)[:57] if path_arg else "waiting for a run"))
+    st = {"csv": None, "log": None, "path": None}
+
+    head = tk.Frame(root, bg=BG)
+    head.place(x=0, y=0, relwidth=1, height=26)
+    tk.Label(head, text="ROTA", bg=BG, fg=WHITE, font=tkfont.Font(family="Consolas", size=11, weight="bold")).pack(side="left", padx=(8, 6))
+    run_name = tk.Label(head, text="waiting for a run...", bg=BG, fg=DIMMER, font=tkfont.Font(family="Consolas", size=8))
+    run_name.pack(side="left")
+    status = tk.Label(head, text="● idle", bg=BG, fg=DIMMER, font=tkfont.Font(family="Consolas", size=8))
+    status.pack(side="right", padx=8)
+
+    left = tk.Frame(root, bg=CARD)
+    left.place(relx=0, y=26, relwidth=0.4, relheight=1, height=-26)
+    mono = tkfont.Font(family="Consolas", size=8)
+    txt = tk.Text(left, bg=CARD, fg=DIM, font=mono, wrap="none", borderwidth=0, highlightthickness=0, state="disabled")
+    txt.pack(fill="both", expand=True, padx=6, pady=4)
+    for name, col in (("dim", DIMMER), ("white", WHITE), ("red", RED), ("yellow", YELLOW)):
+        txt.tag_configure(name, foreground=col)
+
+    right = tk.Frame(root, bg=BG)
+    right.place(relx=0.4, y=26, relwidth=0.6, relheight=1, height=-26)
+    strip = tk.Frame(right, bg=BG)
+    strip.pack(fill="x", padx=4, pady=(0, 2))
+    big = tkfont.Font(family="Consolas", size=14, weight="bold")
+    small = tkfont.Font(family="Consolas", size=7)
+    tiles = {}
+    for key, label in (("fps", "fps"), ("ms", "frame ms"), ("pipelines_making", "pipelines"),
+                       ("textures_waiting", "textures"), ("vram", "VRAM GB"), ("ram_process_gb", "RAM GB"),
+                       ("gpu_pct", "GPU %")):
+        f = tk.Frame(strip, bg=CARD)
+        f.pack(side="left", expand=True, fill="x", padx=2)
+        v = tk.Label(f, text="--", bg=CARD, fg=WHITE, font=big)
+        v.pack(pady=(3, 0))
+        tk.Label(f, text=label, bg=CARD, fg=DIMMER, font=small).pack(pady=(0, 3))
+        tiles[key] = v
+
+    fig = Figure(facecolor=BG)
+    axes = fig.subplots(4, 1, sharex=True)
+    ax3b = axes[2].twinx()
+    for ax in list(axes) + [ax3b]:
+        ax.set_facecolor(BG)
+        ax.tick_params(colors=DIM, labelsize=6)
+        for sp in ax.spines.values():
+            sp.set_visible(False)
+    for ax in axes:
+        ax.grid(True, color=DIMMER, alpha=0.25, linewidth=0.5)
+    FigureCanvasTkAgg(fig, master=right).get_tk_widget().pack(fill="both", expand=True)
+    canvas = fig.canvas
+
+    def add_text(lines):
+        if not lines:
+            return
+        txt.configure(state="normal")
+        for l in lines[-MAX_LINES:]:
+            txt.insert("end", short_line(l) + "\n", line_color(l))
+        extra = int(txt.index("end-1c").split(".")[0]) - MAX_LINES
+        if extra > 0:
+            txt.delete("1.0", "%d.0" % (extra + 1))
+        txt.configure(state="disabled")
+        txt.see("end")
+
+    def switch(path):
+        st["path"], st["csv"] = path, Csv(path)
+        st["log"] = Tail(os.path.splitext(path)[0] + ".log")
+        txt.configure(state="normal")
+        txt.delete("1.0", "end")
+        txt.configure(state="disabled")
+        base = os.path.basename(path)
+        root.title("Rota panel — " + (base if len(base) < 60 else base[:57] + "..."))
+        run_name.configure(text=base[4:-4][:70])
+
+    def draw():
+        c = st["csv"]
+        t = c.cols.get("t_s", [])
+        if not t:
+            return
+        lo = t[-1] - WINDOW_S
+        i = next((k for k, x in enumerate(t) if x >= lo), 0)
+        xs = t[i:]
+
+        def y(k):
+            return c.cols.get(k, [])[i:]
+
+        for ax in list(axes) + [ax3b]:
+            ax.clear()
+            ax.set_facecolor(BG)
+            ax.tick_params(colors=DIM, labelsize=6)
+            for sp in ax.spines.values():
+                sp.set_visible(False)
+        for ax in axes:
+            ax.grid(True, color=DIMMER, alpha=0.25, linewidth=0.5)
+        a1, a2, a3, a4 = axes
+        a1.plot(xs, y("fps"), color=GREEN, lw=1.2)
+        a1.fill_between(xs, y("fps"), color=GREEN, alpha=0.12, linewidth=0)
+        a1.set_ylim(0, top(y("fps"), 32))
+        a1.axhline(10, color=YELLOW, ls="--", lw=0.8, alpha=0.7)
+        a1.axhline(30, color=DIM, ls="--", lw=0.8, alpha=0.7)
+        a1.set_ylabel("fps", color=DIM, fontsize=7)
+        for k, col in (("preparing_ms", CYAN), ("copy_ms", YELLOW), ("gpu_wait_ms", RED)):
+            a2.plot(xs, y(k), color=col, lw=1, label=k)
+        a2.legend(loc="upper left", fontsize=6, facecolor=BG, edgecolor="none", labelcolor=DIM)
+        a2.set_ylabel("ms", color=DIM, fontsize=7)
+        a3.plot(xs, y("pipelines_making"), color=CYAN, lw=1.2, label="pipelines")
+        ax3b.plot(xs, y("textures_waiting"), color=BLUE, lw=1, label="textures")
+        ax3b.tick_params(colors=DIM, labelsize=6)
+        a3.set_ylim(0, top(y("pipelines_making"), 10))
+        ax3b.set_ylim(0, top(y("textures_waiting"), 10))
+        a3.set_ylabel("pipelines", color=CYAN, fontsize=7)
+        ax3b.set_ylabel("textures", color=BLUE, fontsize=7)
+        ax3b.yaxis.set_label_position("right")  # clear() puts the twin's label back on the left
+        a4.plot(xs, y("vram_used_gb"), color=CYAN, lw=1.2, label="vram used")
+        a4.plot(xs, y("vram_budget_gb"), color=DIM, ls="--", lw=0.9, label="vram budget")
+        a4.set_ylim(0, top(y("vram_budget_gb") + y("vram_used_gb"), 1))  # RAM stays in its tile: it would flatten VRAM
+        a4.legend(loc="lower left", fontsize=6, facecolor=BG, edgecolor="none", labelcolor=DIM, ncol=2)
+        a4.set_ylabel("GB", color=DIM, fontsize=7)
+        a4.set_xlabel("t_s", color=DIM, fontsize=7)
+        fig.subplots_adjust(left=0.08, right=0.92, top=0.99, bottom=0.08, hspace=0.1)
+        canvas.draw_idle()
+
+    def tick():
+        try:
+            if not path_arg:  # follow the newest run, switch when a newer one shows up
+                newest = newest_csv(started)
+                if newest and newest != st["path"]:
+                    switch(newest)
+            elif st["path"] is None and os.path.exists(path_arg):
+                switch(path_arg)
+            if st["csv"]:
+                st["csv"].update()
+                add_text(st["log"].read())
+                c = st["csv"]
+                live = time.time() - os.path.getmtime(st["path"]) < 3  # the game writes a row each second
+                status.configure(text="● live" if live else "● idle", fg=GREEN if live else DIMMER)
+                fps = c.last("fps")
+                tiles["fps"].configure(text=fmt(fps), fg=fps_color(fps))
+                tiles["ms"].configure(text=fmt(c.last("ms")))
+                tiles["pipelines_making"].configure(text=fmt(c.last("pipelines_making"), "%.0f"))
+                tiles["textures_waiting"].configure(text=fmt(c.last("textures_waiting"), "%.0f"))
+                tiles["vram"].configure(text="%s/%s" % (fmt(c.last("vram_used_gb")), fmt(c.last("vram_budget_gb"))))
+                tiles["ram_process_gb"].configure(text=fmt(c.last("ram_process_gb")))
+                tiles["gpu_pct"].configure(text=fmt(c.last("gpu_pct"), "%.0f"))
+                draw()
+        except Exception as e:  # keep the panel alive on a bad row or a file in flux
+            print("panel: %s" % e, file=sys.stderr)
+        root.after(1000, tick)
+
+    tick()
+    root.mainloop()
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--file")
+    ap.add_argument("--selftest")
+    a = ap.parse_args()
+    if a.selftest:
+        selftest(a.selftest)
+    else:
+        run_ui(a.file)
+
+
+if __name__ == "__main__":
+    main()

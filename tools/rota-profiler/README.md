@@ -6,6 +6,7 @@ It has two parts:
 
 - **The frame log**, in the runtime (`crates/victory-gpu/src/framelog`). A diagnostics build writes one CSV line per present when `VICTORY_FRAME_LOG=<file>` is set. Nothing is recorded without the variable, and a build without `diagnostics` has none of it.
 - **`frames.py`** reads the log: `python -I frames.py <frames.csv>`.
+- **`panel.py`**, a live window beside the title: the run's log on the left, and on the right the overlay CSV's numbers (fps, frame ms, pipelines being made, textures waiting, video and process memory, GPU load) with four charts of the last three minutes. `python -I panel.py` follows the newest `run-*.csv` in `local/logs`; `--file <csv>` follows one. It needs `tkinter` and `matplotlib`.
 
 ## Recording
 

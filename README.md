@@ -28,7 +28,7 @@ back end that recompiles the console's GPU programs (GFX10/RDNA2) to DXIL.
 
 | | Cards | System memory | Status |
 |---|---|---|---|
-| **Tested** | RTX 3050 8 GB | 32 GB | playable, ~9.5 fps |
+| **Tested** | RTX 3050 8 GB | 32 GB | playable, ~10 fps |
 | **Target** | RTX 3060, RTX 2070, other 6–8 GB cards | 16–32 GB | not measured yet |
 | **Not a goal** | features that only the newest cards have | | |
 
@@ -39,25 +39,28 @@ and the card) and **no new-card features**: nothing here needs the newest GPUs o
 ## Where it is
 
 **Playable, slowly.** On the RTX 3050 the title boots, takes input and runs through the first
-mission without crashing so far, at about **9.5 fps** from the opening cutscene through the first
+mission without crashing so far, at about **10 fps** from the opening cutscene through the first
 playable area (1080p, Series S profile, `diag` build, the default settings below; the best
-measured run had a median of 9.6 fps, and 10% of its time was under 4.1 fps).
+measured run had a median of 10.3 fps, and 10% of its time was under 8.8 fps).
 
 How the median got there, one change at a time (each bar adds to the one before it):
 
 ```mermaid
 xychart-beta
     title "Median fps, opening cutscene and first playable area (RTX 3050 8 GB)"
-    x-axis ["Texture cap 3072 MB", "No texture cap", "Card steps, slots, 6 workers", "Small buffers on the card (now)"]
-    y-axis "fps" 0 --> 10
-    bar [3.35, 4.6, 7.2, 9.6]
+    x-axis ["Texture cap 3072 MB", "No texture cap", "Card steps, slots, 6 workers", "Small buffers on the card", "2 MiB memory sections, shader switches (now)"]
+    y-axis "fps" 0 --> 12
+    bar [3.35, 4.6, 7.2, 9.6, 10.3]
 ```
+
+The last step mostly steadied the frame: the slowest 10% of the time went from under 4.1 fps to
+under 8.8 fps.
 
 Rendering at half the size (`VICTORY_RENDER_SCALE=0.5`) gives nothing on top of this (6.8 against
 7.2 fps: the frame is the CPU's, not the card's) and breaks the picture (white glare, colored
 blotches, checkered textures), so it is off.
 
-Where the time of one frame goes in the best run (104 ms a frame). The parts overlap (the
+Where the time of one frame goes in the best run (98 ms a frame, medians). The parts overlap (the
 copy-back runs on its own thread beside the preparing), so they do not add up to the frame.
 
 ```mermaid
@@ -65,7 +68,7 @@ xychart-beta
     title "One frame, best run (ms)"
     x-axis ["CPU preparing", "Waiting for the GPU", "Copying back"]
     y-axis "ms" 0 --> 80
-    bar [62, 26, 66]
+    bar [51, 30, 24]
 ```
 
 > [!NOTE]
@@ -124,6 +127,8 @@ you have not set yourself, for `shaders`, `warm` and `run` alike (it prints whic
 VICTORY_RT_MISS=1  VICTORY_RELAY=2  VICTORY_THIN=0  VICTORY_PIPELINE_BOOK=1
 VICTORY_MEMORY_CARD_MB=1024  VICTORY_UPSCALER=6  VICTORY_MEMORY_MAP=0
 VICTORY_CARD_STEPS=1  VICTORY_CARD_ALL=1  VICTORY_DYNAMIC_SLOTS=499999  VICTORY_PIPELINE_WORKERS=6
+VICTORY_SECTION_MB=2  VICTORY_RELAY_COPY=1  VICTORY_CARD_REHASH_RUNS=1
+VICTORY_COMPUTE_LOD=1  VICTORY_WAVE_LDS_LOOSE=1
 ```
 
 The numbers were also taken with `$env:VICTORY_DISPLAY_MODE = '1920x1080'`. To change one, set the

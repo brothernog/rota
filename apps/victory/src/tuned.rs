@@ -25,6 +25,20 @@ pub(crate) const TUNED: &[(&str, &str)] = &[
     ("VICTORY_CARD_ALL", "1"),
     ("VICTORY_DYNAMIC_SLOTS", "499999"),
     ("VICTORY_PIPELINE_WORKERS", "6"),
+    // Title memory in 2 MiB sections, not one per allocation: with hundreds
+    // of thousands of views Windows holds the section lock and each map call
+    // took 5-15 ms (map time 47 -> 4.6 ms a frame, 5.8 -> 9.6 fps at the
+    // cutscene).
+    ("VICTORY_SECTION_MB", "2"),
+    // The copy-back's fetches go over the copy queue, not behind the draws.
+    ("VICTORY_RELAY_COPY", "1"),
+    // One hashing pass per run of touching pieces, not one per range sent up.
+    ("VICTORY_CARD_REHASH_RUNS", "1"),
+    // Shader translation: implicit levels in compute, and looser wave
+    // shared memory (about +5% after the cutscene; change the translation,
+    // so `warm --used` again after turning them off or on).
+    ("VICTORY_COMPUTE_LOD", "1"),
+    ("VICTORY_WAVE_LDS_LOOSE", "1"),
 ];
 
 /// The tuned settings that `is_set` says the user left unset, or none with
