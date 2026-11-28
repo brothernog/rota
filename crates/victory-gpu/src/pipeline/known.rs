@@ -247,6 +247,13 @@ pub fn use_library(dir: PathBuf) {
     super::library::use_pipeline_cache(dir);
 }
 
+/// The list of static samplers is in `dir` (the runs' library folder): this
+/// process makes them first, as a run does (`samplers`), so that what it
+/// makes is what a run makes. Read only, unless [`use_library`] too.
+pub fn use_sampler_list(dir: PathBuf) {
+    super::samplers::use_dir(dir);
+}
+
 /// Writes the library [`use_library`] named if pipelines were stored.
 pub fn save_library() {
     super::library::save(true);

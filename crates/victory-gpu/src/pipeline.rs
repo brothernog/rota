@@ -987,6 +987,8 @@ pub mod known;
 mod library;
 #[cfg(windows)]
 mod make;
+#[cfg(windows)]
+pub(crate) mod samplers;
 
 /// Host pipelines made and loaded from the library so far (the frame log).
 #[cfg(all(windows, feature = "diagnostics"))]

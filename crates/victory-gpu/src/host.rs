@@ -959,6 +959,8 @@ fn create() -> windows::core::Result<Host> {
             .ok();
         log_card(&device, adapter.as_ref(), &o1);
         tracing::info!("host D3D12 device ready");
+        // Before any other root signature: the listed static samplers' places.
+        crate::pipeline::samplers::prepare(&device);
         Ok(Host {
             device,
             queue,

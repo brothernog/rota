@@ -7,8 +7,10 @@
 //! and stored if not), a chunk per process, and save it: a run loads from
 //! that library. With the first pass alone (driver 621.40) the driver's cache
 //! the runs read stayed empty and the runs made the pipelines again.
-//! Pipelines with static samplers stay out of the library (their samplers'
-//! places differ between processes): the second pass only makes them.
+//! Every process makes the listed static samplers first, as a run does; a
+//! pipeline with a sampler not listed yet stays out of the library (its
+//! places would differ between processes): the second pass only makes it,
+//! and lists the sampler for the next warm or run.
 
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
@@ -274,6 +276,8 @@ fn make(dir: &Path, these: &str, store: bool) -> Result<()> {
     let these: Vec<usize> = these.split(',').map(|n| n.parse().context("--these")).collect::<Result<_>>()?;
     let cfg = victory_core::Config::load()?;
     victory_hle::known_pipelines::use_translations(cfg.cache_subdir("shaders")?);
+    // The static samplers a run makes first, made first here too.
+    known::use_sampler_list(dir.to_path_buf());
     if store {
         // The runs' own folder for it (`use_shader_cache`: beside the translations).
         known::use_library(dir.to_path_buf());

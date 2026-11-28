@@ -59,6 +59,7 @@ static DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Keeps the pipeline library and the early list in `dir` from now on.
 pub fn use_pipeline_cache(dir: PathBuf) {
+    super::samplers::use_dir(dir.clone());
     let _ = DIR.set(dir);
 }
 
@@ -288,7 +289,8 @@ thread_local! {
 pub(crate) static UNSTORED: AtomicU64 = AtomicU64::new(0);
 
 /// The pipelines this thread makes while the guard lives have static
-/// samplers (`samplers`): they are made, never loaded from or stored in the
+/// samplers not all made first in this process (`samplers`, see
+/// `samplers::listed`): they are made, never loaded from or stored in the
 /// library, unless `VICTORY_LIBRARY_STATIC_SAMPLERS=1`.
 ///
 /// Why: the card's driver (NVIDIA, 4070 SUPER) keeps static samplers in a
@@ -688,6 +690,8 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
+    // Pipelines with new samplers are not stored: the list may grow alone.
+    super::samplers::save();
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
