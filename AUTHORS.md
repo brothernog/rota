@@ -5,6 +5,8 @@ This project is a fork. Its code comes from these projects, all GPL-3.0-or-later
 - VIctory, the compatibility layer it is built on, and its contributors.
 - fxceless/victory-fork, and edsuuu/VI-BR-PORT, the fork this one starts from
   (imported at commit 3fd18be).
+- trustno1-coder/VIctory-NVIDIA: pipelines with static samplers kept out of the
+  pipeline library (commit 7fa0e95, by readmet3xt-lab).
 
 The people below wrote the imported code, listed by the number of commits they
 authored in the imported history (`git shortlog -sn`; AI tools left out).

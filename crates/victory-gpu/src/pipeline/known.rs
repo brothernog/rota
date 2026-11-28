@@ -252,10 +252,12 @@ pub fn save_library() {
     super::library::save(true);
 }
 
-/// Pipelines loaded from the library and made, since the start.
-pub fn library_counts() -> (u64, u64) {
+/// Pipelines loaded from the library, made and stored, and made without it
+/// (static samplers: `library::with_static_samplers`), since the start.
+pub fn library_counts() -> (u64, u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
-    (super::library::LOADED.load(Relaxed), super::library::MADE.load(Relaxed))
+    let unstored = super::library::UNSTORED.load(Relaxed);
+    (super::library::LOADED.load(Relaxed), super::library::MADE.load(Relaxed) - unstored, unstored)
 }
 
 /// Makes the host pipelines of those of `which` (numbers in the file) and

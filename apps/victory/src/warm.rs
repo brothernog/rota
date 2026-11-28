@@ -7,6 +7,8 @@
 //! and stored if not), a chunk per process, and save it: a run loads from
 //! that library. With the first pass alone (driver 621.40) the driver's cache
 //! the runs read stayed empty and the runs made the pipelines again.
+//! Pipelines with static samplers stay out of the library (their samplers'
+//! places differ between processes): the second pass only makes them.
 
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
@@ -148,7 +150,8 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     println!("{} pipelines into the runs' pipeline library, one process at a time", stored.len());
     // A command line of some 7 KB, and one save of the library per process.
     const CHUNK: usize = 1000;
-    let (mut count, mut unheard, mut skipped, mut loads, mut makes) = (0usize, 0usize, 0usize, 0u64, 0u64);
+    let (mut count, mut unheard, mut skipped) = (0usize, 0usize, 0usize);
+    let (mut loads, mut makes, mut unstored) = (0u64, 0u64, 0u64);
     let mut left = stored.clone();
     while !left.is_empty() {
         let len = left.len().min(CHUNK);
@@ -166,9 +169,10 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
             Some(why) => println!("library of {len} pipelines not saved: {why}"),
             None => {}
         }
-        if let Some((l, m)) = library {
+        if let Some((l, m, u)) = library {
             loads += l;
             makes += m;
+            unstored += u;
         }
         count += heard;
         unheard += len - heard.min(len);
@@ -176,7 +180,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
         println!("{count} of {}, {:.0} s", stored.len(), began.elapsed().as_secs_f64());
     }
     println!(
-        "{count} in the library in {:.0} s: {loads} loaded, {makes} made and stored; {skipped} ended their process",
+        "{count} through the library in {:.0} s: {loads} loaded, {makes} made and stored, {unstored} with static samplers made only; {skipped} ended their process",
         began.elapsed().as_secs_f64()
     );
     if unheard > 0 {
@@ -191,12 +195,12 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// Has a process make `these` (`store`: through the runs' pipeline library);
 /// how many it made, how it ended if not well, and with `store` the
-/// pipelines it loaded from the library and made.
+/// pipelines it loaded from the library, stored, and made only.
 fn child(
     these: &[usize],
     store: bool,
     mut each: impl FnMut(usize, f64, bool),
-) -> (usize, Option<String>, Option<(u64, u64)>) {
+) -> (usize, Option<String>, Option<(u64, u64, u64)>) {
     let list: Vec<String> = these.iter().map(usize::to_string).collect();
     let spawned = std::env::current_exe().and_then(|exe| {
         use std::os::windows::process::CommandExt;
@@ -241,8 +245,10 @@ fn child(
                         each(n, ms, there == "1");
                     }
                 }
-                ["library", loaded, "loaded", made, "made"] => {
-                    library = loaded.parse().ok().zip(made.parse().ok());
+                ["library", loaded, "loaded", made, "made", unstored, "unstored"] => {
+                    if let (Ok(l), Ok(m), Ok(u)) = (loaded.parse(), made.parse(), unstored.parse()) {
+                        library = Some((l, m, u));
+                    }
                 }
                 _ => {}
             }
@@ -285,8 +291,8 @@ fn make(dir: &Path, these: &str, store: bool) -> Result<()> {
     });
     if store {
         known::save_library();
-        let (loaded, made) = known::library_counts();
-        let _ = writeln!(out, "library {loaded} loaded {made} made");
+        let (loaded, made, unstored) = known::library_counts();
+        let _ = writeln!(out, "library {loaded} loaded {made} made {unstored} unstored");
     }
     // Without what a run's end does (the host's threads).
     let _ = out.flush();
