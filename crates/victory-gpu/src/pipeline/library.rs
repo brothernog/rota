@@ -282,6 +282,9 @@ thread_local! {
     /// Whether the pipeline this thread makes has static samplers
     /// ([`with_static_samplers`]).
     static STATIC_SAMPLERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// What the library's name for the pipeline this thread makes adds: its
+    /// static samplers' places ([`with_static_samplers`]).
+    static PLACES: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
 }
 
 /// Pipelines made without the library because they have static samplers
@@ -308,18 +311,36 @@ pub(crate) static UNSTORED: AtomicU64 = AtomicU64::new(0);
 /// shortcut: they are compiled every run (the driver's own cache on disk
 /// makes that quick); a fixed order of static samplers made before any
 /// pipeline would let the library keep them again.
-pub(crate) fn with_static_samplers(samplers: bool) -> StaticSamplers {
-    StaticSamplers(STATIC_SAMPLERS.replace(samplers && !static_samplers_kept()))
+/// With all its static samplers made first in this process, the pipeline is
+/// named in the library with their places too (`samplers::Listed::Places`):
+/// one stored before the list or in another order (other places) is not
+/// loaded, but made and stored again under the new name.
+pub(crate) fn with_static_samplers(listed: super::samplers::Listed) -> StaticSamplers {
+    use super::samplers::Listed;
+    let kept = static_samplers_kept();
+    let (skip, places) = match listed {
+        Listed::None => (false, String::new()),
+        Listed::Places(p) => (false, if kept { String::new() } else { p }),
+        Listed::New => (!kept, String::new()),
+    };
+    StaticSamplers(STATIC_SAMPLERS.replace(skip), PLACES.replace(places))
+}
+
+/// `name` with the places of the static samplers of the pipeline this thread
+/// makes, if they count ([`with_static_samplers`]).
+fn named(name: &str) -> String {
+    PLACES.with_borrow(|p| if p.is_empty() { name.to_owned() } else { format!("{name}-{p}") })
 }
 
 /// While it lives, the pipelines this thread makes skip the library if they
 /// have static samplers ([`with_static_samplers`]); the setting before it
 /// comes back when it is dropped.
-pub(crate) struct StaticSamplers(bool);
+pub(crate) struct StaticSamplers(bool, String);
 
 impl Drop for StaticSamplers {
     fn drop(&mut self) {
         STATIC_SAMPLERS.set(self.0);
+        PLACES.set(std::mem::take(&mut self.1));
     }
 }
 
@@ -597,6 +618,7 @@ pub(crate) fn pipeline(
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
+    let name = &named(name);
     let wide = HSTRING::from(name);
     if STATIC_SAMPLERS.get() {
         UNSTORED.fetch_add(1, Ordering::Relaxed);
@@ -912,7 +934,7 @@ mod tests {
     fn pipelines_with_static_samplers_skip_the_library() {
         let looked = std::cell::Cell::new(false);
         {
-            let _guard = with_static_samplers(true);
+            let _guard = with_static_samplers(super::super::samplers::Listed::New);
             let made = pipeline(
                 "with static samplers",
                 |_, _| {
@@ -924,12 +946,34 @@ mod tests {
             assert!(made.is_err());
             assert!(!looked.get(), "the library was asked");
             {
-                let _inner = with_static_samplers(false);
+                let _inner = with_static_samplers(super::super::samplers::Listed::None);
                 assert!(!STATIC_SAMPLERS.get());
             }
             assert!(STATIC_SAMPLERS.get());
         }
         assert!(!STATIC_SAMPLERS.get());
+    }
+
+    /// One whose static samplers were all made first is looked up under a
+    /// name with their places: an entry stored under the old name (before the
+    /// list, or with other places) does not load.
+    #[test]
+    fn an_entry_stored_before_the_list_does_not_load() {
+        use super::super::samplers::Listed;
+        let old = name("graphics", b"root", &[b"code"], "state");
+        assert_eq!(named(&old), old);
+        let new = {
+            let _guard = with_static_samplers(Listed::Places("0123456789abcdef".into()));
+            assert!(!STATIC_SAMPLERS.get(), "made first, yet kept from the library");
+            named(&old)
+        };
+        assert_ne!(new, old, "the old entry would load");
+        let other = {
+            let _guard = with_static_samplers(Listed::Places("fedcba9876543210".into()));
+            named(&old)
+        };
+        assert_ne!(new, other, "other places, same name");
+        assert_eq!(named(&old), old, "the guard gave the setting back");
     }
 
     #[test]

@@ -601,7 +601,7 @@ impl HostPipeline {
         // Not from the library if it has static samplers not made first in
         // this process (their places in the driver's table would differ:
         // `library::with_static_samplers`, `samplers`).
-        let _samplers = super::library::with_static_samplers(!super::samplers::listed(&samplers));
+        let _samplers = super::library::with_static_samplers(super::samplers::listed(&samplers));
         let code = |i: usize| {
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),

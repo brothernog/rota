@@ -12,13 +12,15 @@
 //! its device is made and before anything else, and keeps them: the listed
 //! ones then have the same places in every process. A pipeline is loaded
 //! from or stored in the library only if all its static samplers were made
-//! so ([`listed`]); one with a sampler new to this process is made and not
-//! kept, and its new samplers join the list for the next one. What comes
+//! so ([`listed`]), under a name with their places in the list (so that one
+//! stored before the list, or in another order, is never loaded); one with a
+//! sampler new to this process is made and not kept, and its new samplers
+//! join the list for the next one. What comes
 //! after the listed ones (new samplers, the layer's own root signatures,
 //! other libraries') cannot move them, and a list that was not saved (a
 //! crash) only leaves its new pipelines out.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -57,9 +59,21 @@ fn on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SAMPLER_ORDER").is_none_or(|v| v != "0"))
 }
 
+/// What [`listed`] says of a title pipeline's static samplers.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Listed {
+    /// It has none.
+    None,
+    /// All made first in this process: the library's name for it adds this
+    /// (their places in the list).
+    Places(String),
+    /// Some not: neither loaded from nor stored in the library.
+    New,
+}
+
 struct List {
-    /// Made at the start of this process, in the list's order.
-    start: HashSet<Key>,
+    /// Made at the start of this process, with their places in the list.
+    start: HashMap<Key, u32>,
     /// The list: those, then the new ones of this process.
     all: Vec<Key>,
     known: HashSet<Key>,
@@ -148,12 +162,12 @@ pub(crate) fn prepare(device: &ID3D12Device) {
     let all = parse(&std::fs::read(dir.join(FILE)).unwrap_or_default());
     let began = std::time::Instant::now();
     let mut kept = Vec::with_capacity(all.len());
-    let mut start = HashSet::new();
-    for k in &all {
+    let mut start = HashMap::new();
+    for (at, k) in all.iter().enumerate() {
         match root(device, k) {
             Ok(r) => {
                 kept.push(r);
-                start.insert(*k);
+                start.insert(*k, at as u32);
             }
             Err(e) => {
                 // Those after it would not have their places: not listed here.
@@ -179,21 +193,23 @@ fn lock() -> std::sync::MutexGuard<'static, Option<List>> {
 
 /// The static samplers of a title pipeline's root signature, about to be
 /// made: whether a pipeline with them may be loaded from and stored in the
-/// library (none, or all made first in this process). New ones join the list.
-pub(crate) fn listed(samplers: &[D3D12_STATIC_SAMPLER_DESC]) -> bool {
+/// library, and under what. New ones join the list.
+pub(crate) fn listed(samplers: &[D3D12_STATIC_SAMPLER_DESC]) -> Listed {
     ROOTS.fetch_add(1, Ordering::Relaxed);
     if samplers.is_empty() {
-        return true;
+        return Listed::None;
     }
     WITH.fetch_add(1, Ordering::Relaxed);
-    lock().as_mut().is_some_and(|list| admit(list, samplers.iter().map(key)))
+    lock().as_mut().map_or(Listed::New, |list| admit(list, samplers.iter().map(key)))
 }
 
 /// [`listed`] on `list`.
-fn admit(list: &mut List, keys: impl Iterator<Item = Key>) -> bool {
+fn admit(list: &mut List, keys: impl Iterator<Item = Key>) -> Listed {
+    let mut places = Vec::new();
     let mut all_made = true;
     for k in keys {
-        if list.start.contains(&k) {
+        if let Some(&at) = list.start.get(&k) {
+            places.extend(at.to_le_bytes());
             continue;
         }
         all_made = false;
@@ -201,7 +217,7 @@ fn admit(list: &mut List, keys: impl Iterator<Item = Key>) -> bool {
             list.all.push(k);
         }
     }
-    all_made
+    if all_made { Listed::Places(blake3::hash(&places).to_hex()[..16].to_owned()) } else { Listed::New }
 }
 
 /// Writes the list if it grew (with the library's saves), and says how
@@ -247,7 +263,7 @@ mod tests {
 
     fn list(start: &[Key]) -> List {
         List {
-            start: start.iter().copied().collect(),
+            start: start.iter().enumerate().map(|(at, k)| (*k, at as u32)).collect(),
             all: start.to_vec(),
             known: start.iter().copied().collect(),
             written: start.len(),
@@ -261,12 +277,22 @@ mod tests {
     fn only_samplers_made_first_open_the_library() {
         let (a, b, c) = (sampler(1), sampler(2), sampler(3));
         let mut l = list(&[a, b]);
-        assert!(admit(&mut l, [a].into_iter()));
-        assert!(admit(&mut l, [b, a].into_iter()));
-        assert!(!admit(&mut l, [a, c].into_iter()), "a new sampler let the pipeline in");
+        assert!(matches!(admit(&mut l, [a].into_iter()), Listed::Places(_)));
+        assert!(matches!(admit(&mut l, [b, a].into_iter()), Listed::Places(_)));
+        assert_eq!(admit(&mut l, [a, c].into_iter()), Listed::New, "a new sampler let the pipeline in");
         assert_eq!(l.all, [a, b, c]);
-        assert!(!admit(&mut l, [c].into_iter()), "listed in this process is not made first");
+        assert_eq!(admit(&mut l, [c].into_iter()), Listed::New, "listed in this process is not made first");
         assert_eq!(l.all, [a, b, c], "listed twice");
+    }
+
+    /// The places name the pipeline: the same samplers at other places in
+    /// the list (another order) give another name.
+    #[test]
+    fn other_places_give_another_name() {
+        let (a, b) = (sampler(1), sampler(2));
+        let first = admit(&mut list(&[a, b]), [a].into_iter());
+        assert_eq!(first, admit(&mut list(&[a, b]), [a].into_iter()));
+        assert_ne!(first, admit(&mut list(&[b, a]), [a].into_iter()));
     }
 
     /// Past the cap the list keeps its length; those pipelines stay out.
@@ -274,7 +300,7 @@ mod tests {
     fn the_list_stops_at_the_cap() {
         let full: Vec<Key> = (0..CAP as u32).map(sampler).collect();
         let mut l = list(&full);
-        assert!(!admit(&mut l, [sampler(CAP as u32)].into_iter()));
+        assert_eq!(admit(&mut l, [sampler(CAP as u32)].into_iter()), Listed::New);
         assert_eq!(l.all.len(), CAP);
     }
 
