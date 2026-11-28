@@ -2,6 +2,7 @@
 
 Run: python -I tools/rota-profiler/panel.py [--file <csv>]
 Check: python -I tools/rota-profiler/panel.py --selftest <csv>
+Prepare: python -I tools/rota-profiler/panel.py --prepare <shaders or warm log>  (check: --selftest-prepare)
 """
 import argparse
 import csv
@@ -291,12 +292,176 @@ def run_ui(path_arg):
     root.mainloop()
 
 
+STEPS = {"shaders": "Translating shaders", "make": "Making pipelines (driver)", "library": "Pipelines into the library"}
+FIRST_TIME = ("First time: no pipeline list yet. The first run will look rough "
+              "(black screen, pipelines being made); close it and preparing runs again.")
+# Formats come from apps/victory/src/warm.rs and translate.rs (precompile).
+RE_KNOWN = re.compile(r"^(\d+) pipelines known, .*; (\d+) to make")
+RE_OF = re.compile(r"^(\d+) of (\d+), (\d+) s$")
+RE_MADE = re.compile(r"^(\d+) made in (\d+) s")
+RE_LIB = re.compile(r"^(\d+) pipelines into the runs' pipeline library")
+RE_LIB_END = re.compile(r"^(\d+) through the library in (\d+) s")
+RE_SH = re.compile(r"^(\d+) shaders in the cache, (\d+) s$")
+RE_SH_END = re.compile(r"^(\d+) shaders in the cache, \d+ do not translate, (\d+) s")
+
+
+class Prep:
+    """Progress of a shaders or warm log. total is None when the log has none (shaders)."""
+
+    def __init__(self):
+        self.step, self.done, self.total, self.secs = None, 0, None, 0.0
+        self.stamp = time.time()  # when the last progress line was read
+        self.step_done, self.finished, self.first_time = False, False, False
+        self.lines = []
+
+    def feed(self, raw):
+        line = short_line(raw).strip()
+        if not line:
+            return
+        self.lines.append(line)
+        del self.lines[:-6]
+        m = RE_KNOWN.match(line)
+        if m:
+            self._start("make", int(m[2]))
+            self.first_time = int(m[1]) == 0
+            return
+        m = RE_LIB.match(line)
+        if m:
+            self._start("library", int(m[1]))
+            return
+        for rx, step, end, fin in ((RE_OF, None, False, False), (RE_MADE, "make", True, False),
+                                   (RE_LIB_END, "library", True, True), (RE_SH, "shaders", False, False),
+                                   (RE_SH_END, "shaders", True, True)):
+            m = rx.match(line)
+            if not m:
+                continue
+            if step and self.step != step:
+                self._start(step, None)
+            if rx is RE_OF:
+                self.done, self.total, self.secs = int(m[1]), int(m[2]), float(m[3])
+            elif rx is RE_SH:
+                self.done, self.secs = int(m[1]), float(m[2])
+            else:
+                self.done, self.secs = int(m[1]), float(m[m.lastindex])
+                self.total = self.done if self.total is None else self.total
+                self.step_done, self.finished = True, fin
+            self.stamp = time.time()
+            return
+
+    def _start(self, step, total):
+        self.step, self.done, self.total, self.secs = step, 0, total, 0.0
+        self.step_done, self.stamp = False, time.time()
+
+    def eta(self, now):
+        if not self.total or not self.done or not self.secs or self.step_done:
+            return None
+        return max(0.0, (self.total - self.done) / (self.done / self.secs) - (now - self.stamp))
+
+
+def hms(s):
+    s = int(s)
+    return "%d:%02d:%02d" % (s // 3600, s % 3600 // 60, s % 60) if s >= 3600 else "%d:%02d" % (s // 60, s % 60)
+
+
+def selftest_prepare():
+    p = Prep()
+    for l in ("88579 pipelines known, 0 made before (abc, card), 0 bad; 5064 to make, 10 processes",
+              "\x1b[32m1000 of 5064, 8 s\x1b[0m"):
+        p.feed(l)
+    assert (p.step, p.done, p.total, p.finished, p.first_time) == ("make", 1000, 5064, False, False)
+    assert p.eta(p.stamp) is not None and abs(p.eta(p.stamp) - 4064 / (1000 / 8)) < 1e-6
+    p.feed("5064 made in 802 s (0 have no host pipeline, 0 ended their process); ms each: median 1.0")
+    assert (p.done, p.total, p.step_done, p.finished) == (5064, 5064, True, False)
+    p.feed("5064 pipelines into the runs' pipeline library, one process at a time")
+    assert (p.step, p.done, p.total, p.step_done) == ("library", 0, 5064, False)
+    p.feed("1000 of 5064, 8 s")
+    assert (p.step, p.done, p.total) == ("library", 1000, 5064)
+    p.feed("5064 through the library in 52 s: 1 loaded, 2 made and stored, 3 with static samplers made only; 0 ended their process")
+    assert (p.done, p.total, p.step_done, p.finished) == (5064, 5064, True, True)
+    p = Prep()
+    p.feed("0 pipelines known, 0 made before (x, y), 0 bad; 0 to make, 4 processes")
+    assert p.first_time and p.total == 0
+    p = Prep()
+    p.feed("2000 shaders in the cache, 31 s")
+    assert (p.step, p.done, p.total, p.finished) == ("shaders", 2000, None, False)
+    p.feed("2100 shaders in the cache, 3 do not translate, 40 s")
+    assert (p.done, p.step_done, p.finished) == (2100, True, True)
+    print("selftest-prepare ok")
+
+
+def run_prepare(path):
+    import tkinter as tk
+    from tkinter import font as tkfont
+
+    root = tk.Tk()
+    root.geometry("720x300")
+    root.configure(bg=BG)
+    # the log's name is in the title: a launcher closes this window by it
+    root.title("Rota — preparing — " + os.path.basename(path)[:50])
+    mono = lambda size, bold=False: tkfont.Font(family="Consolas", size=size, weight="bold" if bold else "normal")
+    tk.Label(root, text="ROTA", bg=BG, fg=WHITE, font=mono(11, True)).place(x=12, y=6)
+    step_l = tk.Label(root, text="waiting for the log...", bg=BG, fg=WHITE, font=mono(14, True), anchor="w")
+    step_l.place(x=12, y=34, width=696)
+    bar = tk.Canvas(root, bg=CARD, height=22, highlightthickness=0)
+    bar.place(x=12, y=72, width=696)
+    info = tk.Label(root, text="", bg=BG, fg=DIM, font=mono(10), anchor="w")
+    info.place(x=12, y=102, width=696)
+    note = tk.Label(root, text="", bg=BG, fg=YELLOW, font=mono(8), anchor="w", justify="left", wraplength=696)
+    note.place(x=12, y=126, width=696, height=30)
+    logbox = tk.Label(root, text="", bg=CARD, fg=DIMMER, font=mono(8), anchor="nw", justify="left")
+    logbox.place(x=12, y=160, width=696, height=128)
+
+    p, tail, st = Prep(), Tail(path), {"quiet": time.time()}
+
+    def tick():
+        try:
+            new = tail.read()
+            for l in new:
+                p.feed(l)
+            if new:
+                st["quiet"] = time.time()
+            now = time.time()
+            ok = p.step_done
+            col = GREEN if ok else CYAN
+            if p.step:
+                step_l.configure(text=STEPS[p.step] + (" - done" if ok else ""), fg=GREEN if ok else WHITE)
+            frac = 1.0 if ok else (p.done / p.total if p.total else 0.0)
+            w = bar.winfo_width()
+            bar.delete("all")
+            if p.step and not ok and not p.total:  # no total (shaders): a sliding block
+                x = int(now * 120) % (w + 80) - 80
+                bar.create_rectangle(max(0, x), 0, min(w, x + 80), 22, fill=col, width=0)
+            else:
+                bar.create_rectangle(0, 0, int(w * frac), 22, fill=col, width=0)
+            eta = p.eta(now)
+            elapsed = p.secs if ok else p.secs + (now - p.stamp if p.step else 0)
+            count = "%d of %d" % (p.done, p.total) if p.total else "%d" % p.done
+            info.configure(text="%s    elapsed %s    ETA %s" % (count, hms(elapsed), hms(eta) if eta is not None else "--") if p.step else "")
+            note.configure(text=FIRST_TIME if p.first_time else "")
+            logbox.configure(text="\n".join(p.lines))
+            if p.finished and now - st["quiet"] > 20:  # final line seen and the log went quiet
+                root.destroy()
+                return
+        except Exception as e:  # keep the window alive on a file in flux
+            print("panel: %s" % e, file=sys.stderr)
+        root.after(250, tick)
+
+    tick()
+    root.mainloop()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--file")
     ap.add_argument("--selftest")
+    ap.add_argument("--prepare", help="follow a shaders or warm log")
+    ap.add_argument("--selftest-prepare", action="store_true")
     a = ap.parse_args()
-    if a.selftest:
+    if a.selftest_prepare:
+        selftest_prepare()
+    elif a.prepare:
+        run_prepare(a.prepare)
+    elif a.selftest:
         selftest(a.selftest)
     else:
         run_ui(a.file)
