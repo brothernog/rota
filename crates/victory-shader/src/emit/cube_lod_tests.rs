@@ -345,3 +345,33 @@ fn flat_implicit_lod_in_compute_samples_with_gradients() {
         }
     }
 }
+
+/// A cube array's face operand is 8 × slice + face.
+#[test]
+#[ignore = "issue #5: a face operand past 5 reads +X (lower.rs, cube_direction)"]
+fn cube_face_operand_of_a_later_slice_reads_its_face() {
+    const SIZE: usize = 4;
+    let mut words = CUBE_PROLOGUE.to_vec();
+    words.push(0x7E1E_0280); // v15 = 0 for output byte offsets
+    let faces = [0.0f32, 1.0, 4.0, 5.0, 8.0, 9.0, 12.0, 13.0];
+    for (i, &face) in faces.iter().enumerate() {
+        for (reg, value) in [1.5f32, 1.5, face, 0.0].iter().enumerate() {
+            words.extend([0x7E00_02FF | ((reg as u32) << 17), value.to_bits()]);
+        }
+        // image_sample_l, CUBE, dmask:R, address v[0:3], result v10.
+        words.extend([0xF000_0118 | (0x24 << 18), 0x00C4_0A00]);
+        // buffer_store_dword v10, v15, s[12:15], 0 offen offset:i*4
+        words.extend([0xE070_1000 | (i as u32 * 4), 0x8003_0A0F]);
+    }
+    words.push(0xBF81_0000); // s_endpgm
+    // Face f of cube c holds 10c + f + 1.
+    let texels: Vec<_> = (0..12u8)
+        .flat_map(|f| std::iter::repeat_n([f32::from(f / 6 * 10 + f % 6 + 1); 4], SIZE * SIZE))
+        .collect();
+    let native = cube_program(words, [1, 1, 1]);
+    let cubes = View::CubeArray(SIZE as u32, 1, 2, &texels);
+    for (name, got) in run_cube(&native, cubes, faces.len() as u32) {
+        let read: Vec<_> = got.iter().map(|v| v - 1.0).collect();
+        assert_eq!(read, [0.0, 1.0, 4.0, 5.0, 10.0, 11.0, 14.0, 15.0], "{name}");
+    }
+}

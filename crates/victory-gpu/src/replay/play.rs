@@ -3512,26 +3512,29 @@ fn make_device(frame: &Frame, debug: bool, breadcrumbs: bool) -> Result<(ID3D12D
                 dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
             }
         }
-        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
-        let mut adapter = None;
-        for i in 0.. {
-            let Ok(a) = factory.EnumAdapters1(i) else {
-                break;
-            };
-            let d = a.GetDesc1()?;
-            if (d.VendorId, d.DeviceId) == (frame.vendor, frame.device) {
-                adapter = Some(a);
-                break;
+        let selected = victory_core::adapter::selected()?;
+        let mut recorded = None;
+        if selected.is_none() {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            for i in 0.. {
+                let Ok(a) = factory.EnumAdapters1(i) else {
+                    break;
+                };
+                let d = a.GetDesc1()?;
+                if (d.VendorId, d.DeviceId) == (frame.vendor, frame.device) {
+                    recorded = Some(a);
+                    break;
+                }
+            }
+            if recorded.is_none() {
+                tracing::warn!(
+                    "the adapter recorded on ({}) is not here: the default one is used",
+                    frame.adapter
+                );
             }
         }
-        if adapter.is_none() {
-            tracing::warn!(
-                "the adapter recorded on ({}) is not here: the default one is used",
-                frame.adapter
-            );
-        }
         let mut device: Option<ID3D12Device> = None;
-        match &adapter {
+        match selected.or(recorded.as_ref()) {
             Some(a) => D3D12CreateDevice(a, D3D_FEATURE_LEVEL_12_0, &mut device)?,
             None => D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?,
         }

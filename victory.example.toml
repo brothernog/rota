@@ -3,6 +3,11 @@
 # Environment variables (shown below) take precedence over this file.
 # VICTORY_CONFIG selects a different config file.
 
+[gpu]
+# Zero-based index from `victory adapters`. Omit for automatic selection.
+# env: VICTORY_ADAPTER
+# adapter = 0
+
 [paths]
 # Your own dump of the title.     env: VICTORY_GAME_DIR
 game_dir = 'D:\victory-data\game'

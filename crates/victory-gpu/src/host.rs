@@ -833,7 +833,7 @@ pub(crate) fn host() -> Option<&'static Host> {
     .as_ref()
 }
 
-fn create() -> windows::core::Result<Host> {
+fn create() -> anyhow::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
         // The debug layer only in builds with diagnostics.
@@ -886,7 +886,10 @@ fn create() -> windows::core::Result<Host> {
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_WARP") {
+        if let Some(adapter) = victory_core::adapter::selected()? {
+            D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            crate::tdr::log();
+        } else if cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_WARP") {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");

@@ -28,6 +28,7 @@
 //! workers have usually made it by its first dispatch.
 
 use std::collections::VecDeque;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -93,11 +94,21 @@ impl Pending {
     }
 
     fn make(&self) {
-        self.made.get_or_init(|| {
+        self.make_with(|| {
             let began = Instant::now();
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
             made
+        });
+    }
+
+    fn make_with(&self, build: impl FnOnce() -> Option<HostPipeline>) {
+        self.made.get_or_init(|| match catch_unwind(AssertUnwindSafe(build)) {
+            Ok(pipeline) => pipeline,
+            Err(_) => {
+                tracing::warn!(shaders = ?self.shaders, "host pipeline build panicked");
+                None
+            }
         });
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -535,6 +546,30 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_panicking_pipeline_is_refused_and_the_worker_continues() {
+        let failed = Pending::new(Vec::new(), None);
+        let next = Pending::new(Vec::new(), None);
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    failed.make_with(|| panic!("synthetic pipeline build panic"));
+                    next.make();
+                })
+                .join()
+                .expect("the pipeline worker should survive");
+        });
+        assert!(matches!(failed.made.get(), Some(None)));
+        assert!(matches!(next.made.get(), Some(None)));
+
+        let mut retries = 0;
+        failed.make_with(|| {
+            retries += 1;
+            None
+        });
+        assert_eq!(retries, 0);
+    }
 
     #[test]
     fn worker_count_follows_the_processors_and_the_switch() {

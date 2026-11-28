@@ -63,7 +63,7 @@ fn err(e: windows::core::Error) -> String {
 }
 
 impl Host {
-    /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
+    /// The selected adapter, falling back to the default or requested WARP.
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
@@ -79,7 +79,9 @@ impl Host {
                 }
             }
             let mut device: Option<ID3D12Device> = None;
-            if warp {
+            if let Some(adapter) = victory_core::adapter::selected().map_err(|e| e.to_string())? {
+                D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+            } else if warp {
                 let factory: IDXGIFactory4 =
                     CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
                 let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
@@ -998,6 +1000,8 @@ pub enum View<'a> {
     Texture(u32, u32, &'a [[f32; 4]]),
     /// An RGBA32F cube SRV (face size, mip count, texels in D3D subresource order).
     Cube(u32, u16, &'a [[f32; 4]]),
+    /// An RGBA32F cube array SRV (face size, mip count, cubes, texels in D3D subresource order).
+    CubeArray(u32, u16, u32, &'a [[f32; 4]]),
     /// A raw buffer UAV of this many dwords, zeroed.
     RawUav(u32),
     /// An RGBA32F texture UAV (width, height), zeroed.
@@ -1174,10 +1178,11 @@ impl Host {
                 let mut at = views.GetCPUDescriptorHandleForHeapStart();
                 at.ptr += i * view_size;
                 match *v {
-                    View::Texture(..) | View::Cube(..) => {
+                    View::Texture(..) | View::Cube(..) | View::CubeArray(..) => {
                         let (w, h, mut texels, faces, mips) = match *v {
                             View::Texture(w, h, t) => (w, h, t, 1, 1),
                             View::Cube(n, mips, t) => (n, n, t, 6, mips),
+                            View::CubeArray(n, mips, cubes, t) => (n, n, t, 6 * cubes, mips),
                             _ => unreachable!(),
                         };
                         let mut desc = texture(w, h, D3D12_RESOURCE_FLAG_NONE);
@@ -1227,7 +1232,7 @@ impl Host {
                             D3D12_RESOURCE_STATE_COPY_DEST,
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                         )]);
-                        let cube = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                        let mut cube = D3D12_SHADER_RESOURCE_VIEW_DESC {
                             Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
                             ViewDimension: D3D12_SRV_DIMENSION_TEXTURECUBE,
                             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
@@ -1238,9 +1243,17 @@ impl Host {
                                 },
                             },
                         };
+                        if let View::CubeArray(_, _, cubes, _) = *v {
+                            cube.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
+                            cube.Anonymous.TextureCubeArray = D3D12_TEXCUBE_ARRAY_SRV {
+                                MipLevels: u32::from(mips),
+                                NumCubes: cubes,
+                                ..Default::default()
+                            };
+                        }
                         dev.CreateShaderResourceView(
                             &tex,
-                            (faces == 6).then_some(&cube as *const _),
+                            (faces > 1).then_some(&cube as *const _),
                             at,
                         );
                         keep.push(tex);
